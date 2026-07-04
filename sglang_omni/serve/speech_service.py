@@ -57,7 +57,7 @@ _TTS_TASK_TYPE_ALIASES = {
     task_type.replace("_", "").replace("-", "").lower(): task_type
     for task_type in SUPPORTED_TTS_TASK_TYPES
 }
-MAX_SPEECH_INPUT_CHARS = 4096
+MAX_SPEECH_INPUT_CHARS = 40096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
