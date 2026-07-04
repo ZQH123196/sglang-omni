@@ -21,7 +21,7 @@ from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_
 from sglang_omni.scheduling.types import ARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
-MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
+MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 40096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
