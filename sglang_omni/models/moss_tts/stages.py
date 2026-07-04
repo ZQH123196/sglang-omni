@@ -140,20 +140,20 @@ def create_sglang_tts_engine_executor(
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
     overrides = build_generation_batch_overrides(
-        max_running_requests=16,
+        max_running_requests=32,
         server_args_overrides=server_args_overrides,
         dtype=dtype,
         disable_cuda_graph=False,
         disable_overlap_schedule=True,
         enable_torch_compile=False,
-        max_prefill_tokens=8192,
+        max_prefill_tokens=40096,
         sampling_backend="pytorch",
         trust_remote_code=True,
     )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
-        context_length=8192,
+        context_length=40096,
         **overrides,
     )
 
