@@ -31,7 +31,8 @@ from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_
 from sglang_omni.scheduling.types import ARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
-MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
+MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 35000
+#MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
