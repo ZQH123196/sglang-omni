@@ -42,7 +42,9 @@ from sglang_omni.models.weight_loader import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MOSS_TTS_AUDIO_TOKENIZER = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+DEFAULT_MOSS_TTS_AUDIO_TOKENIZER = "/root/autodl-fs/models/OpenMOSS-Team/MOSS-Audio-Tokenizer"
+#DEFAULT_MOSS_TTS_AUDIO_TOKENIZER = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+
 _LOUDNESS_TARGET_DBFS = -20.0
 _LOUDNESS_GAIN_MIN_DB = -3.0
 _LOUDNESS_GAIN_MAX_DB = 3.0

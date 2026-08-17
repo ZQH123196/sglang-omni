@@ -52,12 +52,13 @@ class MossTtsEngineBuilder(TtsEngineBuilder):
         dtype: str,
     ) -> dict[str, Any]:
         return {
-            "max_running_requests": 16,
+            "max_running_requests": 64,
+            #"max_running_requests": 16,
             "dtype": dtype,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
-            "max_prefill_tokens": min(self.context_length, 8192),
+            "max_prefill_tokens": 35000,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
         }
