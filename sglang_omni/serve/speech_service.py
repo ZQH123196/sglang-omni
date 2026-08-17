@@ -55,7 +55,8 @@ _TTS_TASK_TYPE_ALIASES = {
     task_type.replace("_", "").replace("-", "").lower(): task_type
     for task_type in SUPPORTED_TTS_TASK_TYPES
 }
-MAX_SPEECH_INPUT_CHARS = 4096
+MAX_SPEECH_INPUT_CHARS = 35000
+#MAX_SPEECH_INPUT_CHARS = 4096
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 _ReferenceCacheKey = tuple[Any, ...]
 

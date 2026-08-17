@@ -12,7 +12,8 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
 class MossTtsEngineBuilder(TtsEngineBuilder):
     model_name = "MOSS-TTS"
-    context_length = 8192
+    context_length = 35000
+    #context_length = 8192
     model_arch_override = "MossTTSDelaySGLangModel"
 
     def generation_defaults(
@@ -21,12 +22,14 @@ class MossTtsEngineBuilder(TtsEngineBuilder):
         dtype: str,
     ) -> dict[str, Any]:
         return {
-            "max_running_requests": 16,
+            "max_running_requests": 64,
+            #"max_running_requests": 16,
             "dtype": dtype,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
-            "max_prefill_tokens": 8192,
+            "max_prefill_tokens": 35000,
+            #"max_prefill_tokens": 8192,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
         }
