@@ -1329,6 +1329,59 @@ class OmniScheduler:
             )
         )
 
+    def _speech_deferred_queue(self) -> list:
+        return getattr(self, "_speech_deferred", [])
+
+    def _rebalance_speech_deferred(self) -> None:
+        """把池子已释放、现在放得下的 deferred 请求放回 waiting_queue。"""
+        deferred = getattr(self, "_speech_deferred", None)
+        if not deferred:
+            return
+        pool = self.token_to_kv_pool_allocator
+        back: list = []
+        stay: list = []
+        for req in deferred:
+            est = getattr(req, "_moss_speech_frames", None)
+            need = (
+                len(req.origin_input_ids) + int(est)
+                if est is not None
+                else 0
+            )
+            if need and pool.available_size() >= need:
+                back.append(req)
+            else:
+                stay.append(req)
+        if back:
+            self.waiting_queue = back + self.waiting_queue
+        self._speech_deferred = stay
+
+    def _defer_unadmittable_prefill_requests(self) -> None:
+        """容量准入(预留制):按入参估算的峰值帧数预留池子,放不下就推迟。
+
+        正常 prefill 准入由上游 Scheduler 处理(0.5.16 不用 fork 的
+        PrefillManager),所以这里在委托上游前,把预估放不下的请求从
+        waiting_queue 挪到私有 deferred 队列;池子释放后由
+        :meth:`_rebalance_speech_deferred` 放回。这样池满时是排队而不是
+        上游 retract 踢人。无估算的请求(非 MOSS / 上游对象变化)不拦。
+        """
+        if not self.waiting_queue:
+            return
+        pool = self.token_to_kv_pool_allocator
+        deferred = self._speech_deferred_queue()
+        kept: list = []
+        for req in self.waiting_queue:
+            est = getattr(req, "_moss_speech_frames", None)
+            if est is None:
+                kept.append(req)
+                continue
+            need = len(req.origin_input_ids) + int(est)
+            if pool.available_size() >= need:
+                kept.append(req)
+            else:
+                deferred.append(req)
+        self.waiting_queue = kept
+        self._speech_deferred = deferred
+
     def get_next_batch_to_run(self):
         """Bridge Omni's batch-owning loops to the upstream scheduler contract.
 
@@ -1349,6 +1402,8 @@ class OmniScheduler:
         #
         # Upstream passes running_batch in and expects a NextBatchPlan back,
         # so the coalesce hold-off returns an empty plan rather than None.
+        self._rebalance_speech_deferred()
+        self._defer_unadmittable_prefill_requests()
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
         decode_is_idle = running_batch is None or running_batch.is_empty()
@@ -1822,6 +1877,10 @@ class OmniScheduler:
             self._run_abort_callback(request_id)
         self._pending_stream_ingress.pop(request_id, None)
         self._deferred_request_payloads.pop(request_id, None)
+        if getattr(self, "_speech_deferred", None):
+            self._speech_deferred = [
+                req for req in self._speech_deferred if req.rid != request_id
+            ]
         self._dirty_deferred_request_ids.discard(request_id)
         self._first_emit_done.discard(request_id)
         # Note: (Jiaxin Deng) emit before discarding, and discard whether or
