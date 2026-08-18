@@ -482,10 +482,46 @@ def _prepare_moss_tts_request(
     )
 
 
+def _estimate_moss_tts_speech_frames(payload: StagePayload) -> int | None:
+    """校验文本语言白名单并估算输出帧数(供准入预留用)。
+
+    白名单外的语言在此抛 ``UnsupportedLanguageError``(不支持语言报错反馈),
+    请求不会进入调度,不占用任何队列/池子资源。返回 ``None`` 表示文本为空,
+    无需预留。
+    """
+    from sglang_omni.models.moss_tts.speech_budget import (
+        UnsupportedLanguageError,
+        detect_language,
+        estimate_output_frames,
+        resolve_language,
+    )
+
+    inputs = payload.request.inputs or {}
+    text, _ = normalize_moss_tts_inputs(inputs)
+    if not text.strip():
+        return None
+    params = payload.request.params or {}
+    tts_params = (payload.request.metadata or {}).get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    # 剥掉 ${token:N} 前缀,避免把控制标记计入字符数。
+    text, _ = _resolve_token_count(text, params, tts_params)
+    # 显式 language 参数优先;未指定则按文本字符检测(白名单外都抛不支持语言)。
+    language = _resolve_optional_text(
+        tts_params.get("language") or params.get("language")
+    )
+    if language is not None:
+        lang = resolve_language(language)
+    else:
+        lang = detect_language(text)
+    return estimate_output_frames(text, lang)
+
+
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     """Run MOSS-TTS prompt/reference preprocessing outside the AR scheduler."""
 
     rid = str(payload.request_id)
+    speech_frames = _estimate_moss_tts_speech_frames(payload)
     context = _QUEUE.begin(rid)
     if context is None:
         raise RuntimeError(
@@ -510,6 +546,8 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     data = prepared.state.to_dict()
     if published:
         data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
+    if speech_frames is not None:
+        data["_moss_speech_frames"] = speech_frames
     return StagePayload(
         request_id=payload.request_id, request=payload.request, data=data
     )
@@ -743,6 +781,7 @@ def build_sglang_moss_tts_request(
     req._omni_prompt_only_radix = True
     req._omni_prompt_cache_key = req.extra_key
     req._codec_suppress_tokens = None
+    req._moss_speech_frames = payload.data.get("_moss_speech_frames")
 
     data = MossTTSSGLangRequestData(
         input_ids=prepared.input_ids,
