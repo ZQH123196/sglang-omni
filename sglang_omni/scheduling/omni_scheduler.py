@@ -73,6 +73,9 @@ _COMPLETED_REQUEST_ID_LIMIT = 10000
 _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
 
+# rebalance 放不回时的重试宽限:KV 释放可能延迟,3s 内不重算,给池子时间。
+_REBALANCE_RETRY_INTERVAL_S = 3.0
+
 
 class _PendingStreamIngress:
     """Stream input buffered for a request the scheduler has not admitted."""
@@ -369,7 +372,7 @@ class OmniScheduler:
         self._speech_deferred: list = []
         self._speech_admit_banner_logged: bool = False
         self._speech_admit_no_estimate_warned: bool = False
-        self._speech_admit_rebalance_last_ts: float = 0.0
+        self._speech_admit_rebalance_retry_ts: float = 0.0
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -1382,10 +1385,23 @@ class OmniScheduler:
         return pool_available, running_committed_future, effective_free
 
     def _rebalance_speech_deferred(self) -> None:
-        """把池子已释放、现在放得下的 deferred 请求放回 waiting_queue。"""
+        """把池子已释放、现在放得下的 deferred 请求放回 waiting_queue。
+
+        KV 释放可能有延迟:请求完成/abort 后 pool.available_size() 不一定
+        立刻反映释放结果。因此放不回时不每轮重算(浪费且刷屏),而是记下
+        上次尝试时间,>= REBALANCE_RETRY_INTERVAL(3s) 才再算一次,给 pool
+        释放宽限期。日志纯事件驱动:只在真有请求放回时打 INFO。
+        """
         deferred = getattr(self, "_speech_deferred", None)
         if not deferred:
             return
+        # 宽限节流:距上次"放不回"尝试不足 3s 则跳过,给 KV 释放时间,也避免
+        # 每轮重算+刷屏。一旦放回请求则立即清零时间戳(下一轮无宽限,趁热放)。
+        now = time.monotonic()
+        last_ts = getattr(self, "_speech_admit_rebalance_retry_ts", 0.0)
+        if last_ts and now - last_ts < _REBALANCE_RETRY_INTERVAL_S:
+            return
+
         pool_available, running_committed_future, effective_free = (
             self._speech_effective_free()
         )
@@ -1405,6 +1421,7 @@ class OmniScheduler:
                 stay.append(req)
         if back:
             self.waiting_queue = back + self.waiting_queue
+            self._speech_admit_rebalance_retry_ts = 0.0  # 放回了,清宽限
             logger.info(
                 "speech-admit rebalance: %d requests returned to waiting_queue "
                 "(pool_available=%d, running_committed_future=%d, "
@@ -1416,39 +1433,8 @@ class OmniScheduler:
                 len(stay),
             )
         else:
-            # deferred 有请求但一个都放不回:诊断关键。时间节流(>=60s 同状态
-            # 才再打一次),因为 pool_available 每轮都微变,状态变化节流无效。
-            running_n = len(self.running_batch.reqs) if self.running_batch else 0
-            first_peak = None
-            first_estimated = None
-            first_decoded = None
-            if stay:
-                first = stay[0]
-                est = getattr(first, "_moss_speech_frames", None)
-                if est is not None:
-                    first_estimated = int(est)
-                    first_decoded = len(first.output_ids)
-                    first_peak = len(first.origin_input_ids) + first_estimated
-            now = time.monotonic()
-            last_ts = getattr(self, "_speech_admit_rebalance_last_ts", 0.0)
-            if now - last_ts >= 60.0:
-                self._speech_admit_rebalance_last_ts = now
-                logger.warning(
-                    "speech-admit rebalance: %d deferred requests but NONE returned "
-                    "(pool_available=%d, running_committed_future=%d, "
-                    "effective_free=%d, running=%d, waiting=%d, "
-                    "first_peak_footprint=%d, first_estimated_output=%d, "
-                    "first_decoded_so_far=%d)",
-                    len(deferred),
-                    pool_available,
-                    running_committed_future,
-                    pool_available - running_committed_future,
-                    running_n,
-                    len(self.waiting_queue),
-                    first_peak,
-                    first_estimated,
-                    first_decoded,
-                )
+            # 放不回:记下时间戳,3s 内不再重算(给 KV 释放宽限,且不刷屏)。
+            self._speech_admit_rebalance_retry_ts = now
         self._speech_deferred = stay
 
     def _defer_unadmittable_prefill_requests(self) -> None:
