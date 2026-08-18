@@ -369,7 +369,7 @@ class OmniScheduler:
         self._speech_deferred: list = []
         self._speech_admit_banner_logged: bool = False
         self._speech_admit_no_estimate_warned: bool = False
-        self._speech_admit_rebalance_last_sig: tuple | None = None
+        self._speech_admit_rebalance_last_ts: float = 0.0
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -1416,8 +1416,8 @@ class OmniScheduler:
                 len(stay),
             )
         else:
-            # deferred 有请求但一个都放不回:诊断关键。只在状态变化时打
-            # (effective_free 或 deferred 数变化),避免每轮刷屏。
+            # deferred 有请求但一个都放不回:诊断关键。时间节流(>=60s 同状态
+            # 才再打一次),因为 pool_available 每轮都微变,状态变化节流无效。
             running_n = len(self.running_batch.reqs) if self.running_batch else 0
             first_peak = None
             first_estimated = None
@@ -1429,15 +1429,10 @@ class OmniScheduler:
                     first_estimated = int(est)
                     first_decoded = len(first.output_ids)
                     first_peak = len(first.origin_input_ids) + first_estimated
-            sig = (
-                pool_available,
-                running_committed_future,
-                running_n,
-                len(deferred),
-            )
-            last_sig = getattr(self, "_speech_admit_rebalance_last_sig", None)
-            if sig != last_sig:
-                self._speech_admit_rebalance_last_sig = sig
+            now = time.monotonic()
+            last_ts = getattr(self, "_speech_admit_rebalance_last_ts", 0.0)
+            if now - last_ts >= 60.0:
+                self._speech_admit_rebalance_last_ts = now
                 logger.warning(
                     "speech-admit rebalance: %d deferred requests but NONE returned "
                     "(pool_available=%d, running_committed_future=%d, "
