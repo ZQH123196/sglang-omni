@@ -68,8 +68,10 @@ class MossTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        if schedule_batch.is_prefill_only:
-            return
+        # note: prefill 后必须始终采样第一帧。纯 prefill batch(is_prefill_only)
+        # 若跳过采样,第一步 decode 的 pending_feedback_queue 为空 → 全 0 embeds
+        # → 垃圾 logits → argmax 命中 im_end → 立即 EOS → 0s 音频。
+        # 并发准入把池子打满后,纯 prefill batch 高频出现,该路径必须与混批一致。
         self._collect_moss_step(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
