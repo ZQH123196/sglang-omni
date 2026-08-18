@@ -362,6 +362,13 @@ class OmniScheduler:
 
         # Batch state
         self.waiting_queue: list = []
+        # Speech capacity admission (MOSS-TTS): requests whose estimated peak
+        # KV footprint exceeds the pool's available space are moved here from
+        # waiting_queue so the pool fills by queuing, not by upstream retract.
+        # See get_new_batch_prefill / _defer_unadmittable_prefill_requests.
+        self._speech_deferred: list = []
+        self._speech_admit_banner_logged: bool = False
+        self._speech_admit_no_estimate_warned: bool = False
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -1332,55 +1339,176 @@ class OmniScheduler:
     def _speech_deferred_queue(self) -> list:
         return getattr(self, "_speech_deferred", [])
 
+    def _speech_running_committed_future(self) -> int:
+        """已运行请求"还没长完"的输出帧承诺总和。
+
+        每个 running 请求的估算输出帧数(``_moss_speech_frames``)减去已生成
+        帧数(``len(req.output_ids)``),剩下的就是它未来 decode 还要占用池子
+        的量。``pool.available_size()`` 已含它们当前已分配的部分,所以准入时
+        只扣这个"未来还要长出来的"部分,避免与已分配量重复计算。
+
+        推导:effective_free = available - Σ(remaining_output_i)
+                            = total - Σ(allocated_i) - Σ(estimated_output_i - decoded_i)
+                            = total - Σ(allocated_input_i + estimated_output_i)
+                            = total - Σ(running 请求峰值足迹)
+
+        无估算的 running 请求不计入(无法预判),由调用方日志暴露。
+        """
+        running_batch = self.running_batch
+        if not running_batch or not running_batch.reqs:
+            return 0
+        committed = 0
+        for req in running_batch.reqs:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                continue
+            decoded_so_far = len(req.output_ids)
+            remaining = int(estimated_output) - decoded_so_far
+            if remaining > 0:
+                committed += remaining
+        return committed
+
+    def _speech_effective_free(self) -> tuple[int, int, int]:
+        """返回 (pool_available, running_committed_future, effective_free)。
+
+        effective_free = pool_available - running_committed_future,即扣除已运行
+        请求未来增长后、真正还能接纳新请求峰值的空闲量。这是守门的正确尺子。
+        """
+        pool = self.token_to_kv_pool_allocator
+        pool_available = pool.available_size()
+        running_committed_future = self._speech_running_committed_future()
+        effective_free = pool_available - running_committed_future
+        return pool_available, running_committed_future, effective_free
+
     def _rebalance_speech_deferred(self) -> None:
         """把池子已释放、现在放得下的 deferred 请求放回 waiting_queue。"""
         deferred = getattr(self, "_speech_deferred", None)
         if not deferred:
             return
-        pool = self.token_to_kv_pool_allocator
+        pool_available, running_committed_future, effective_free = (
+            self._speech_effective_free()
+        )
         back: list = []
         stay: list = []
         for req in deferred:
-            est = getattr(req, "_moss_speech_frames", None)
-            need = (
-                len(req.origin_input_ids) + int(est)
-                if est is not None
-                else 0
-            )
-            if need and pool.available_size() >= need:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                # 无估算的请求本不该被 defer,放回让其走上游正常路径。
                 back.append(req)
+                continue
+            peak_footprint = len(req.origin_input_ids) + int(estimated_output)
+            if effective_free >= peak_footprint:
+                back.append(req)
+                effective_free -= peak_footprint  # 串行预留,防同批超卖
             else:
                 stay.append(req)
         if back:
             self.waiting_queue = back + self.waiting_queue
+            logger.info(
+                "speech-admit rebalance: %d requests returned to waiting_queue "
+                "(pool_available=%d, running_committed_future=%d, "
+                "effective_free=%d, deferred_remaining=%d)",
+                len(back),
+                pool_available,
+                running_committed_future,
+                pool_available - running_committed_future,
+                len(stay),
+            )
         self._speech_deferred = stay
 
     def _defer_unadmittable_prefill_requests(self) -> None:
-        """容量准入(预留制):按入参估算的峰值帧数预留池子,放不下就推迟。
+        """容量准入(预留制):按峰值足迹预留池子,放不下就推迟。
+
+        准入目的:池子永不溢出、上游 retract 永不触发。手段 = 只在请求的
+        "峰值足迹"(输入实长 + 估算输出帧)放得下时才放行,短文本秒进、长文本
+        排队等释放。
+
+        守门尺子必须扣两项,否则会超卖(每个单独看放得下、加起来超池子):
+        (1) 已运行请求"还没长完"的输出帧(它们还会继续 decode 占池子),
+            由 :meth:`_speech_running_committed_future` 计算;
+        (2) 本次循环里已放行请求的峰值(串行预留,防同一批超卖)。
 
         正常 prefill 准入由上游 Scheduler 处理(0.5.16 不用 fork 的
-        PrefillManager),所以这里在委托上游前,把预估放不下的请求从
-        waiting_queue 挪到私有 deferred 队列;池子释放后由
-        :meth:`_rebalance_speech_deferred` 放回。这样池满时是排队而不是
-        上游 retract 踢人。无估算的请求(非 MOSS / 上游对象变化)不拦。
+        PrefillManager),这里在委托上游前把放不下的从 waiting_queue 挪到
+        私有 deferred 队列;池子释放后由 :meth:`_rebalance_speech_deferred`
+        放回。无估算的请求(非 MOSS / preprocess 未挂字段)无法预判,放行但
+        由日志暴露——若全部请求都无估算,准入等于没设卡。
         """
+        if not self._speech_admit_banner_logged:
+            self._speech_admit_banner_logged = True
+            logger.info(
+                "speech-admit: capacity admission ENABLED "
+                "(OmniScheduler.get_new_batch_prefill override active)"
+            )
         if not self.waiting_queue:
             return
-        pool = self.token_to_kv_pool_allocator
+
+        pool_available, running_committed_future, effective_free = (
+            self._speech_effective_free()
+        )
         deferred = self._speech_deferred_queue()
         kept: list = []
+        reqs_with_estimate = 0
+        reqs_without_estimate = 0
+        sample_peak_footprint = None
+        newly_deferred = 0
         for req in self.waiting_queue:
-            est = getattr(req, "_moss_speech_frames", None)
-            if est is None:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                reqs_without_estimate += 1
                 kept.append(req)
                 continue
-            need = len(req.origin_input_ids) + int(est)
-            if pool.available_size() >= need:
+            reqs_with_estimate += 1
+            peak_footprint = len(req.origin_input_ids) + int(estimated_output)
+            if sample_peak_footprint is None:
+                sample_peak_footprint = peak_footprint
+            if effective_free >= peak_footprint:
                 kept.append(req)
+                effective_free -= peak_footprint  # 串行预留,防同批超卖
             else:
                 deferred.append(req)
+                newly_deferred += 1
         self.waiting_queue = kept
         self._speech_deferred = deferred
+
+        if newly_deferred > 0:
+            logger.info(
+                "speech-admit defer: %d requests moved to _speech_deferred "
+                "(pool_available=%d, running_committed_future=%d, "
+                "effective_free=%d, sample_peak_footprint=%d, "
+                "waiting %d->%d, deferred_total=%d, "
+                "reqs_with_estimate=%d, reqs_without_estimate=%d)",
+                newly_deferred,
+                pool_available,
+                running_committed_future,
+                pool_available - running_committed_future,
+                sample_peak_footprint,
+                reqs_with_estimate + reqs_without_estimate,
+                len(kept),
+                len(deferred),
+                reqs_with_estimate,
+                reqs_without_estimate,
+            )
+
+        # 估算缺失检测(状态转换时打一次,非定时):若所有 waiting 请求都没有
+        # _moss_speech_frames 估算,说明 preprocess 没挂字段,准入对这些请求
+        # 等于没设卡——这是"为什么还在 retract"的关键诊断信号。
+        all_without_estimate = (
+            reqs_with_estimate == 0 and reqs_without_estimate > 0
+        )
+        if all_without_estimate and not self._speech_admit_no_estimate_warned:
+            self._speech_admit_no_estimate_warned = True
+            logger.warning(
+                "speech-admit: %d waiting requests have NO _moss_speech_frames "
+                "estimate; admission cannot gate them (preprocess not attaching?). "
+                "pool_available=%d running_committed_future=%d effective_free=%d",
+                reqs_without_estimate,
+                pool_available,
+                running_committed_future,
+                pool_available - running_committed_future,
+            )
+        elif not all_without_estimate:
+            self._speech_admit_no_estimate_warned = False
 
     def get_next_batch_to_run(self):
         """Bridge Omni's batch-owning loops to the upstream scheduler contract.
