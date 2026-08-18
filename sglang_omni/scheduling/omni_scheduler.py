@@ -1414,6 +1414,29 @@ class OmniScheduler:
                 pool_available - running_committed_future,
                 len(stay),
             )
+        else:
+            # deferred 有请求但一个都放不回:诊断关键。打 waiting/running 状态
+            # + 第一个 stay 请求的 peak_footprint,定位是 pool 真不够还是别的问题。
+            running_n = len(self.running_batch.reqs) if self.running_batch else 0
+            first_peak = None
+            if stay:
+                first = stay[0]
+                est = getattr(first, "_moss_speech_frames", None)
+                if est is not None:
+                    first_peak = len(first.origin_input_ids) + int(est)
+            logger.warning(
+                "speech-admit rebalance: %d deferred requests but NONE returned "
+                "(pool_available=%d, running_committed_future=%d, "
+                "effective_free=%d, running=%d, waiting=%d, "
+                "first_peak_footprint=%d)",
+                len(deferred),
+                pool_available,
+                running_committed_future,
+                pool_available - running_committed_future,
+                running_n,
+                len(self.waiting_queue),
+                first_peak,
+            )
         self._speech_deferred = stay
 
     def _defer_unadmittable_prefill_requests(self) -> None:
