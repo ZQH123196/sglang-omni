@@ -1553,11 +1553,40 @@ class OmniScheduler:
         # so the coalesce hold-off returns an empty plan rather than None.
         self._rebalance_speech_deferred()
         self._defer_unadmittable_prefill_requests()
+
+        def _log_admit_summary(plan):
+            """prefill 委托上游后打一条汇总:本次放行数 + 累计 running + 剩余排队。
+
+            让用户一条日志看清全局,不用拼 defer/rebalance/prefill 多条。
+            只在本次真有请求 prefill 时打(batch_to_run 非空且有 reqs)。
+            """
+            batch = getattr(plan, "batch_to_run", None)
+            if batch is None or not getattr(batch, "reqs", None):
+                return
+            admitted = len(batch.reqs)
+            running_n = (
+                len(self.running_batch.reqs) if self.running_batch else 0
+            )
+            deferred_n = len(getattr(self, "_speech_deferred", []) or [])
+            logger.info(
+                "speech-admit: %d requests prefilled this round "
+                "(running_total=%d, deferred_queueing=%d, "
+                "pool_available=%d)",
+                admitted,
+                running_n,
+                deferred_n,
+                self.token_to_kv_pool_allocator.available_size(),
+            )
+
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            plan = _Upstream.get_new_batch_prefill(self, running_batch)
+            _log_admit_summary(plan)
+            return plan
         decode_is_idle = running_batch is None or running_batch.is_empty()
         if not self.prefill_coalesce_when_idle and decode_is_idle:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            plan = _Upstream.get_new_batch_prefill(self, running_batch)
+            _log_admit_summary(plan)
+            return plan
         if self.prefill_coalesce_requires_pending_builds:
             with self._request_admission_lock:
                 build_work_pending = bool(
@@ -1568,10 +1597,14 @@ class OmniScheduler:
             if not build_work_pending and not (
                 self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
             ):
-                return _Upstream.get_new_batch_prefill(self, running_batch)
+                plan = _Upstream.get_new_batch_prefill(self, running_batch)
+                _log_admit_summary(plan)
+                return plan
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            plan = _Upstream.get_new_batch_prefill(self, running_batch)
+            _log_admit_summary(plan)
+            return plan
         now = time.perf_counter()
         oldest = now
         for req in waiting:
@@ -1580,7 +1613,9 @@ class OmniScheduler:
                 t = req._coalesce_enqueue_t = now
             oldest = min(oldest, t)
         if now - oldest >= self.prefill_coalesce_wait_s:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            plan = _Upstream.get_new_batch_prefill(self, running_batch)
+            _log_admit_summary(plan)
+            return plan
         return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):
