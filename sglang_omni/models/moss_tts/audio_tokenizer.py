@@ -33,16 +33,81 @@ except ImportError:
     _fa4_cute_varlen = None
 
 
+def _make_fa4_varlen_adapter(cute_varlen):
+    """Wrap flash-attn-4's cute varlen to accept sglang's positional call convention.
+
+    sglang 0.5.16 (and MOSS audio_tokenizer) call the varlen kernel with 7
+    positional args:
+        fn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+           causal=..., window_size=..., ...)
+
+    flash-attn-4's cute `flash_attn_varlen_func` declares cu_seqlens_q,
+    cu_seqlens_k, max_seqlen_q, max_seqlen_k as keyword-only (all default
+    None). Passing them positionally misaligns: the 6th positional arg
+    (max_seqlen_q int) lands on a wrong slot, and cute's internal assertion
+    `cu_seqlens_k.shape == (batch_size + 1,)` raises
+    `AttributeError: 'int' object has no attribute 'shape'`.
+
+    This adapter translates the classic FA2 positional convention to cute's
+    keyword convention. Unknown kwargs are forwarded (cute ignores extras
+    it doesn't recognize, or raises TypeError which the vocoder try/except
+    catches and degrades gracefully).
+    """
+
+    def _adapter(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        *,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        return_attn_probs=False,
+        **kwargs,
+    ):
+        return cute_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap if softcap else None,
+            **kwargs,
+        )
+
+    _adapter.__name__ = "fa4_varlen_adapter"
+    _adapter.__qualname__ = "fa4_varlen_adapter"
+    return _adapter
+
+
 def _resolve_flash_attn_varlen():
     """Pick a varlen kernel that actually works at call time on this device.
 
     sglang's flash_attn_varlen_func lazily falls back to classic FA2 on non-Hopper
     GPUs (e.g. Blackwell SM 12.0), and that lazy import fails when flash-attn-4 is
     installed without classic flash-attn-2. Detect that by probing the FA2 symbol
-    flash_attn_varlen_func directly; if missing, prefer flash-attn-4's cute impl.
+    flash_attn_varlen_func directly; if missing, prefer flash-attn-4's cute impl,
+    wrapped in an adapter that translates sglang's positional call convention to
+    cute's keyword-only signature.
     """
     if flash_attn_varlen_func is None:
-        return _fa4_cute_varlen
+        if _fa4_cute_varlen is not None:
+            logger.info(
+                "sglang flash_attn_varlen_func unavailable; "
+                "using flash-attn-4 cute varlen (adapted) for MOSS packed flash attention."
+            )
+            return _make_fa4_varlen_adapter(_fa4_cute_varlen)
+        return None
     try:
         from flash_attn import flash_attn_varlen_func as _fa2_probe  # noqa: F401
         return flash_attn_varlen_func
@@ -50,9 +115,9 @@ def _resolve_flash_attn_varlen():
         if _fa4_cute_varlen is not None:
             logger.info(
                 "sglang flash_attn_varlen_func FA2 fallback unavailable; "
-                "using flash-attn-4 cute varlen for MOSS packed flash attention."
+                "using flash-attn-4 cute varlen (adapted) for MOSS packed flash attention."
             )
-            return _fa4_cute_varlen
+            return _make_fa4_varlen_adapter(_fa4_cute_varlen)
         return None
 
 from sglang_omni.models.moss_tts.hf_loading import moss_transformers_processor_compat
