@@ -1372,6 +1372,39 @@ class OmniScheduler:
                 committed += remaining
         return committed
 
+    def _speech_admit_input_increment(self, req: Any) -> int:
+        """radix 命中后输入真实增量;失败回退全量(行为退化为现状)。
+
+        旧尺子用 ``len(req.origin_input_ids)`` 全量算输入,但同文本并发时
+        输入 KV 大部分被 radix 共享(实测 3910 输入里 3909 命中),实际只
+        新增 1 token,尺子超卖预留 3909 倍,池子剩 37% 空也判"放不下",
+        峰值卡 0.63。
+
+        修复:主动调 ``req.init_next_round_input()``(SGLang Req 自带方法,
+        上游 prefill 本就要调,这里提前调一次),让它算 radix、把真实增量
+        填到 ``req.extend_range.length``。尺子读这个字段替代全长。
+
+        不动上游源码,只在 fork 里调现成方法。失败/无方法回退全长,
+        行为退化为现状,不会更糟。
+        """
+        init = getattr(req, "init_next_round_input", None)
+        if not callable(init):
+            return len(req.origin_input_ids)
+        try:
+            init()
+        except Exception:
+            logger.exception(
+                "speech-admit: req.init_next_round_input failed for %s; "
+                "fallback to full input len",
+                getattr(req, "rid", "?"),
+            )
+            return len(req.origin_input_ids)
+        ext = getattr(req, "extend_range", None)
+        if ext is None:
+            return len(req.origin_input_ids)
+        length = int(getattr(ext, "length", 0) or 0)
+        return max(1, length)  # radix 全命中时为 0,兜底 1
+
     def _speech_effective_free(self) -> tuple[int, int, int]:
         """返回 (pool_available, running_committed_future, effective_free)。
 
@@ -1413,7 +1446,7 @@ class OmniScheduler:
                 # 无估算的请求本不该被 defer,放回让其走上游正常路径。
                 back.append(req)
                 continue
-            peak_footprint = len(req.origin_input_ids) + int(estimated_output)
+            peak_footprint = self._speech_admit_input_increment(req) + int(estimated_output)
             if effective_free >= peak_footprint:
                 back.append(req)
                 effective_free -= peak_footprint  # 串行预留,防同批超卖
@@ -1449,6 +1482,14 @@ class OmniScheduler:
             由 :meth:`_speech_running_committed_future` 计算;
         (2) 本次循环里已放行请求的峰值(串行预留,防同一批超卖)。
 
+        输入部分用 :meth:`_speech_admit_input_increment` 而非
+        ``len(req.origin_input_ids)`` 全量:radix 命中后输入新增接近 0
+        (同文本并发时 3910 输入里 3909 共享),按全量算尺子超卖预留
+        3909 倍,池子剩 37% 空也判"放不下",峰值卡 0.63。该方法主动调
+        ``req.init_next_round_input()`` 拿 ``req.extend_range.length``
+        (radix 后真实增量),失败回退全量(行为退化为旧尺子)。输出帧
+        每请求独立 KV 无共享,``estimated_output`` 必须保留全量。
+
         正常 prefill 准入由上游 Scheduler 处理(0.5.16 不用 fork 的
         PrefillManager),这里在委托上游前把放不下的从 waiting_queue 挪到
         私有 deferred 队列;池子释放后由 :meth:`_rebalance_speech_deferred`
@@ -1480,7 +1521,7 @@ class OmniScheduler:
                 kept.append(req)
                 continue
             reqs_with_estimate += 1
-            peak_footprint = len(req.origin_input_ids) + int(estimated_output)
+            peak_footprint = self._speech_admit_input_increment(req) + int(estimated_output)
             if sample_peak_footprint is None:
                 sample_peak_footprint = peak_footprint
             if effective_free >= peak_footprint:
