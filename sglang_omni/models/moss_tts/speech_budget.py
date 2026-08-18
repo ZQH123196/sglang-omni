@@ -15,6 +15,8 @@ surface against upstream tiny.
 
 from __future__ import annotations
 
+import threading
+
 __all__ = (
     "SUPPORTED_LANGUAGES",
     "SPEECH_RATE_PER_MIN",
@@ -22,6 +24,8 @@ __all__ = (
     "resolve_language",
     "detect_language",
     "estimate_output_frames",
+    "SpeechRateCalibrator",
+    "calibrator",
 )
 
 # 语言白名单。请求文本主要字符不属于这些语言时,直接报"不支持语言"错误。
@@ -97,6 +101,79 @@ def resolve_language(spec: str) -> str:
             f"{SUPPORTED_LANGUAGES}"
         )
     return lang
+
+
+class SpeechRateCalibrator:
+    """运行时语速标定器(按语言)。
+
+    每个完成的请求把 (输入字符数, 实际生成帧数) 累计进来;某个语言累计
+    达到 :attr:`MIN_SAMPLES` 个有效样本后,:meth:`effective_rate` 返回实测
+    均值语速(字符/分钟),用于覆盖默认语速表——每次估算都实时查当前标定值,
+    随负载自动适应。实测均值仍按"宁多勿少"原则:估算函数统一再乘
+    :data:`SAFETY_FACTOR`(≈20% 波动余量)预留。
+
+    累计求和求均值等价于按时长加权平均(长文本样本权重更高),比逐个样本
+    平均更稳。``frames <= 0`` 的失败请求不参与统计,避免污染均值。
+    """
+
+    MIN_SAMPLES = 5
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chars: dict[str, int] = {}
+        self._frames: dict[str, int] = {}
+        self._count: dict[str, int] = {}
+
+    def observe(self, lang: str, chars: int, frames: int) -> None:
+        """记录一个已完成请求的 (字符数, 实际生成帧数)。"""
+        if frames <= 0 or chars <= 0:
+            return
+        with self._lock:
+            self._chars[lang] = self._chars.get(lang, 0) + int(chars)
+            self._frames[lang] = self._frames.get(lang, 0) + int(frames)
+            self._count[lang] = self._count.get(lang, 0) + 1
+
+    def effective_rate(self, lang: str) -> float | None:
+        """实测均值语速(字符/分钟);样本不足 :attr:`MIN_SAMPLES` 返回 None。"""
+        with self._lock:
+            count = self._count.get(lang, 0)
+            if count < self.MIN_SAMPLES:
+                return None
+            total_frames = self._frames.get(lang, 0)
+            total_minutes = total_frames / (CODEC_FRAMES_PER_SEC * SECONDS_PER_MIN)
+            if total_minutes <= 0:
+                return None
+            return self._chars[lang] / total_minutes
+
+    def sample_count(self, lang: str) -> int:
+        with self._lock:
+            return self._count.get(lang, 0)
+
+    def reset(self, lang: str | None = None) -> None:
+        """清空全部或指定语言的标定统计(测试/运维用)。"""
+        with self._lock:
+            if lang is None:
+                self._chars.clear()
+                self._frames.clear()
+                self._count.clear()
+            else:
+                self._chars.pop(lang, None)
+                self._frames.pop(lang, None)
+                self._count.pop(lang, None)
+
+
+# 进程级单例:单进程 pipeline 内所有请求共享同一份标定统计。
+calibrator = SpeechRateCalibrator()
+
+
+def _calibrated_rate(lang: str) -> float:
+    """取该语言的估算语速:标定均值(限幅)优先,否则默认表。"""
+    default = SPEECH_RATE_PER_MIN[lang]
+    measured = calibrator.effective_rate(lang)
+    if measured is None:
+        return default
+    # 限幅:异常样本(超长/超短音频)拉偏时,不让标定值偏离默认表太远。
+    return max(min(measured, default * 2.0), default * 0.5)
 
 
 def _script_span(text: str) -> dict[str, int]:
@@ -175,6 +252,8 @@ def estimate_output_frames(text: str, lang: str | None = None) -> int:
     """估算文本最多生成多少输出帧(含 20% 波动余量)。
 
     公式:字符数 / 语速(字符/分) × 60 秒 × 12.5Hz × SAFETY_FACTOR。
+    语速优先取运行时标定均值(≥5 个样本后生效),否则用默认表;每次调用
+    实时查询,负载变化后自动跟随。
     """
     if lang is None:
         lang = detect_language(text)
@@ -186,7 +265,8 @@ def estimate_output_frames(text: str, lang: str | None = None) -> int:
     chars = len(text.strip())
     if chars == 0:
         return 0
-    minutes = chars / SPEECH_RATE_PER_MIN[lang]
+    rate = _calibrated_rate(lang)
+    minutes = chars / rate
     frames = int(
         minutes * SECONDS_PER_MIN * CODEC_FRAMES_PER_SEC * SAFETY_FACTOR
     )
