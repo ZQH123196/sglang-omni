@@ -369,6 +369,7 @@ class OmniScheduler:
         self._speech_deferred: list = []
         self._speech_admit_banner_logged: bool = False
         self._speech_admit_no_estimate_warned: bool = False
+        self._speech_admit_rebalance_last_sig: tuple | None = None
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -1415,28 +1416,44 @@ class OmniScheduler:
                 len(stay),
             )
         else:
-            # deferred 有请求但一个都放不回:诊断关键。打 waiting/running 状态
-            # + 第一个 stay 请求的 peak_footprint,定位是 pool 真不够还是别的问题。
+            # deferred 有请求但一个都放不回:诊断关键。只在状态变化时打
+            # (effective_free 或 deferred 数变化),避免每轮刷屏。
             running_n = len(self.running_batch.reqs) if self.running_batch else 0
             first_peak = None
+            first_estimated = None
+            first_decoded = None
             if stay:
                 first = stay[0]
                 est = getattr(first, "_moss_speech_frames", None)
                 if est is not None:
-                    first_peak = len(first.origin_input_ids) + int(est)
-            logger.warning(
-                "speech-admit rebalance: %d deferred requests but NONE returned "
-                "(pool_available=%d, running_committed_future=%d, "
-                "effective_free=%d, running=%d, waiting=%d, "
-                "first_peak_footprint=%d)",
-                len(deferred),
+                    first_estimated = int(est)
+                    first_decoded = len(first.output_ids)
+                    first_peak = len(first.origin_input_ids) + first_estimated
+            sig = (
                 pool_available,
                 running_committed_future,
-                pool_available - running_committed_future,
                 running_n,
-                len(self.waiting_queue),
-                first_peak,
+                len(deferred),
             )
+            last_sig = getattr(self, "_speech_admit_rebalance_last_sig", None)
+            if sig != last_sig:
+                self._speech_admit_rebalance_last_sig = sig
+                logger.warning(
+                    "speech-admit rebalance: %d deferred requests but NONE returned "
+                    "(pool_available=%d, running_committed_future=%d, "
+                    "effective_free=%d, running=%d, waiting=%d, "
+                    "first_peak_footprint=%d, first_estimated_output=%d, "
+                    "first_decoded_so_far=%d)",
+                    len(deferred),
+                    pool_available,
+                    running_committed_future,
+                    pool_available - running_committed_future,
+                    running_n,
+                    len(self.waiting_queue),
+                    first_peak,
+                    first_estimated,
+                    first_decoded,
+                )
         self._speech_deferred = stay
 
     def _defer_unadmittable_prefill_requests(self) -> None:
