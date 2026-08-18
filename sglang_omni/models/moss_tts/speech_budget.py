@@ -15,6 +15,8 @@ surface against upstream tiny.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from collections import deque
 
@@ -62,6 +64,13 @@ CODEC_FRAMES_PER_SEC = 12.5
 SECONDS_PER_MIN = 60.0
 # ±20% 波动余量:宁多勿少,避免超卖池子触发 retract。
 SAFETY_FACTOR = 1.2
+
+# 标定值持久化路径(相对 cwd)。重启后从该文件加载上次标定样本,避免
+# 从零重新攒 5 个样本才能覆盖默认表。多进程(DP)各持单例各自读写,
+# 竞态最坏情况是文件损坏→下次加载失败→从空开始(best-effort,不报错)。
+_CALIBRATION_CACHE_PATH = os.path.join(
+    ".cache", "speech_rate_calibration.json"
+)
 
 
 class UnsupportedLanguageError(ValueError):
@@ -118,18 +127,61 @@ class SpeechRateCalibrator:
 
     实测均值仍按"宁多勿少"原则:估算函数统一再乘 :data:`SAFETY_FACTOR`
     (≈20% 波动余量)预留。``frames <= 0`` 的失败请求不参与统计。
+
+    持久化:构造时从 ``cache_path`` 加载上次样本(JSON,每语言一个
+    [(chars, frames), ...] 列表);每次 :meth:`observe` / :meth:`reset`
+    后同步写回。重启不丢标定值,新请求 preprocess 立即用上次实测语速
+    而非默认表,避免"重启后前 5 个请求用默认 300 估算偏大、进 running
+    后估算冻住、running_committed_future 偏大压死 effective_free"的
+    时序盲区。多进程(DP)各持单例各自读写,竞态最坏情况是文件损坏→
+    下次加载失败→从空开始(best-effort,不报错)。
     """
 
     MIN_SAMPLES = 5
     MAX_SAMPLES = 50
     OUTLIER_RATIO = 0.5
 
-    def __init__(self) -> None:
+    def __init__(self, cache_path: str | None = None) -> None:
         self._lock = threading.Lock()
         self._samples: dict[str, deque[tuple[int, int]]] = {}
+        self._cache_path = cache_path
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        if not self._cache_path:
+            return
+        try:
+            with open(self._cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for lang, samples in data.items():
+                bucket = deque(maxlen=self.MAX_SAMPLES)
+                bucket.extend(
+                    (int(chars), int(frames)) for chars, frames in samples
+                )
+                self._samples[lang] = bucket
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+            # 首次启动或缓存损坏,从空开始(best-effort)。
+            pass
+
+    def _save_cache(self) -> None:
+        if not self._cache_path:
+            return
+        try:
+            cache_dir = os.path.dirname(self._cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            data = {
+                lang: [list(pair) for pair in bucket]
+                for lang, bucket in self._samples.items()
+            }
+            with open(self._cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            # 缓存写入失败不影响运行时标定,仅下次重启丢这批样本。
+            pass
 
     def observe(self, lang: str, chars: int, frames: int) -> None:
-        """记录一个已完成请求的 (字符数, 实际生成帧数)。"""
+        """记录一个已完成请求的 (字符数, 实际生成帧数),并写回缓存。"""
         if frames <= 0 or chars <= 0:
             return
         with self._lock:
@@ -137,6 +189,7 @@ class SpeechRateCalibrator:
                 lang, deque(maxlen=self.MAX_SAMPLES)
             )
             bucket.append((int(chars), int(frames)))
+            self._save_cache()
 
     def effective_rate(self, lang: str) -> float | None:
         """实测均值语速(字符/分钟);样本不足或剔除后不足则返回 None。"""
@@ -168,16 +221,18 @@ class SpeechRateCalibrator:
             return len(bucket) if bucket else 0
 
     def reset(self, lang: str | None = None) -> None:
-        """清空全部或指定语言的标定统计(测试/运维用)。"""
+        """清空全部或指定语言的标定统计(测试/运维用),并写回缓存。"""
         with self._lock:
             if lang is None:
                 self._samples.clear()
             else:
                 self._samples.pop(lang, None)
+            self._save_cache()
 
 
 # 进程级单例:单进程 pipeline 内所有请求共享同一份标定统计。
-calibrator = SpeechRateCalibrator()
+# 加载 ./.cache/speech_rate_calibration.json,重启复用上次标定样本。
+calibrator = SpeechRateCalibrator(cache_path=_CALIBRATION_CACHE_PATH)
 
 
 def _calibrated_rate(lang: str) -> float:
