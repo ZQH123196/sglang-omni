@@ -108,12 +108,9 @@ class MossTTSLocalModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        try:
-            is_prefill_only = schedule_batch.is_prefill_only
-        except AttributeError:
-            is_prefill_only = False
-        if bool(is_prefill_only):
-            return
+        # note: prefill 后必须始终采样第一帧。纯 prefill batch(is_prefill_only)
+        # 若跳过采样,第一步 decode 的反馈队列为空 → 全 0 embeds → 垃圾 logits
+        # → 立即 EOS → 0s 音频。与 moss_tts(delay)同步修复。
         self._collect_frame(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
