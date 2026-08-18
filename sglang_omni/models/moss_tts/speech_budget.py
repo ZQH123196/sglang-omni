@@ -16,6 +16,7 @@ surface against upstream tiny.
 from __future__ import annotations
 
 import threading
+from collections import deque
 
 __all__ = (
     "SUPPORTED_LANGUAGES",
@@ -104,62 +105,75 @@ def resolve_language(spec: str) -> str:
 
 
 class SpeechRateCalibrator:
-    """运行时语速标定器(按语言)。
+    """运行时语速标定器(按语言,滑动窗口)。
 
-    每个完成的请求把 (输入字符数, 实际生成帧数) 累计进来;某个语言累计
-    达到 :attr:`MIN_SAMPLES` 个有效样本后,:meth:`effective_rate` 返回实测
-    均值语速(字符/分钟),用于覆盖默认语速表——每次估算都实时查当前标定值,
-    随负载自动适应。实测均值仍按"宁多勿少"原则:估算函数统一再乘
-    :data:`SAFETY_FACTOR`(≈20% 波动余量)预留。
+    每个完成的请求把 (输入字符数, 实际生成帧数) 计入该语言的**最近
+    :attr:`MAX_SAMPLES` 个样本**(超出丢弃最旧);累计达到 :attr:`MIN_SAMPLES`
+    个有效样本后,:meth:`effective_rate` 返回实测均值语速(字符/分钟),用于
+    覆盖默认语速表——每次估算都实时查当前标定值,随负载自动适应。
 
-    累计求和求均值等价于按时长加权平均(长文本样本权重更高),比逐个样本
-    平均更稳。``frames <= 0`` 的失败请求不参与统计,避免污染均值。
+    异常剔除:偏离均值超过 :attr:`OUTLIER_RATIO`(50%)的样本视为生成错误
+    (如输出直接奔 max_new_tokens 上限、或 0 值),不参与均值计算;剔除后
+    剩余样本不足 :attr:`MIN_SAMPLES` 则返回 None(回退默认表)。
+
+    实测均值仍按"宁多勿少"原则:估算函数统一再乘 :data:`SAFETY_FACTOR`
+    (≈20% 波动余量)预留。``frames <= 0`` 的失败请求不参与统计。
     """
 
     MIN_SAMPLES = 5
+    MAX_SAMPLES = 50
+    OUTLIER_RATIO = 0.5
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._chars: dict[str, int] = {}
-        self._frames: dict[str, int] = {}
-        self._count: dict[str, int] = {}
+        self._samples: dict[str, deque[tuple[int, int]]] = {}
 
     def observe(self, lang: str, chars: int, frames: int) -> None:
         """记录一个已完成请求的 (字符数, 实际生成帧数)。"""
         if frames <= 0 or chars <= 0:
             return
         with self._lock:
-            self._chars[lang] = self._chars.get(lang, 0) + int(chars)
-            self._frames[lang] = self._frames.get(lang, 0) + int(frames)
-            self._count[lang] = self._count.get(lang, 0) + 1
+            bucket = self._samples.setdefault(
+                lang, deque(maxlen=self.MAX_SAMPLES)
+            )
+            bucket.append((int(chars), int(frames)))
 
     def effective_rate(self, lang: str) -> float | None:
-        """实测均值语速(字符/分钟);样本不足 :attr:`MIN_SAMPLES` 返回 None。"""
+        """实测均值语速(字符/分钟);样本不足或剔除后不足则返回 None。"""
         with self._lock:
-            count = self._count.get(lang, 0)
-            if count < self.MIN_SAMPLES:
+            bucket = self._samples.get(lang)
+            if bucket is None or len(bucket) < self.MIN_SAMPLES:
                 return None
-            total_frames = self._frames.get(lang, 0)
-            total_minutes = total_frames / (CODEC_FRAMES_PER_SEC * SECONDS_PER_MIN)
+            per_min = CODEC_FRAMES_PER_SEC * SECONDS_PER_MIN
+            rates = [chars * per_min / frames for chars, frames in bucket]
+            base = sum(rates) / len(rates)
+            if base <= 0:
+                return None
+            kept = [
+                (chars, frames)
+                for (chars, frames), rate in zip(bucket, rates)
+                if abs(rate - base) / base <= self.OUTLIER_RATIO
+            ]
+            if len(kept) < self.MIN_SAMPLES:
+                return None
+            total_chars = sum(chars for chars, _ in kept)
+            total_minutes = sum(frames for _, frames in kept) / per_min
             if total_minutes <= 0:
                 return None
-            return self._chars[lang] / total_minutes
+            return total_chars / total_minutes
 
     def sample_count(self, lang: str) -> int:
         with self._lock:
-            return self._count.get(lang, 0)
+            bucket = self._samples.get(lang)
+            return len(bucket) if bucket else 0
 
     def reset(self, lang: str | None = None) -> None:
         """清空全部或指定语言的标定统计(测试/运维用)。"""
         with self._lock:
             if lang is None:
-                self._chars.clear()
-                self._frames.clear()
-                self._count.clear()
+                self._samples.clear()
             else:
-                self._chars.pop(lang, None)
-                self._frames.pop(lang, None)
-                self._count.pop(lang, None)
+                self._samples.pop(lang, None)
 
 
 # 进程级单例:单进程 pipeline 内所有请求共享同一份标定统计。
