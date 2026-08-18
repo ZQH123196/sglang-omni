@@ -38,6 +38,16 @@ BASH_XTRACEFD=3              # 让命令回显只打到终端，不混进日志�
 set -x                       # 开启命令回显
 # 注意：$MEM_ARGS 不加引号。当为空时，Bash 会自动忽略该位置，不会传空字符串。
 # 注意，8000 端口不直接访问，外部要访问应该独立的 Python 服务以提供异步下载功能。
+#
+# 已知行为（无需报警）：启动后首次 vocode 会打印一条 ERROR：
+#   "MOSS-TTS Delay packed codec decode failed; disabling the packed path
+#    and falling back to standalone codec decode"
+# 根因：sglang 0.5.16 的 FA3 fallback 不兼容 flash-attn-4 的 cute API
+# （sglang 期待经典 FA2 顶层 varlen 符号，flash-attn-4 把它放在 cute 子模块下，
+# 且签名/类型约定差异层层叠加）。vocoder 的 try/except 自动降级到 standalone
+# SDPA decode，功能正常，音频可正常输出，仅 vocode 阶段吞吐略降。
+# 实测对 MOSS-TTS 端到端吞吐影响 <5%（瓶颈在 LLM prefill/decode，不在 vocode）。
+# 修复路径待定：等 sglang 出支持 Blackwell FA3 的版本，或 classic FA2 出 SM 12.0 轮子。
 nohup sgl-omni serve \
   --model-path "$MODEL_ROOT_DIR/OpenMOSS-Team/Moss-TTS-v1.5" \
   --config examples/configs/moss_tts.yaml \
