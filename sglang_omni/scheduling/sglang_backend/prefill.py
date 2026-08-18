@@ -99,6 +99,15 @@ class PrefillManager:
                     running_batch.batch_is_full = True
                 break
 
+            # 输入长度感知准入(预留制):按 preprocess 估算的峰值帧数预留池子,
+            # 放不下就留队等待,让池满时排队而不是上游 retract 踢人。
+            # 字段缺失(非 MOSS 请求 / 上游对象变化)时自动跳过,静默降级。
+            est_frames = getattr(req, "_moss_speech_frames", None)
+            if est_frames is not None:
+                need = len(req.origin_input_ids) + int(est_frames)
+                if self.token_to_kv_pool_allocator.available_size() < need:
+                    continue
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
