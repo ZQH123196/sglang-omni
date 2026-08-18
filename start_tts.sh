@@ -1,5 +1,5 @@
 # source .venv/bin/activate
-# source /etc/network_turbo 运行过程中可能还要在 hf 下载模型。
+# source /etc/network_turbo autodl 翻墙，下运行过程中可能还要在 hf 下载模型。
 # 下面的 export 跟上面的一模一样，只是方便用户复制此段重新跑而已
 
 # 强制让系统优先加载系统自带的（更新的）C++ 基础库
@@ -17,12 +17,15 @@ if command -v nvidia-smi &> /dev/null; then
     VRAM_GB=$((VRAM_MB / 1024))
     echo "📊 自动检测到 NVIDIA GPU 显存: ${VRAM_GB} GB"
 
-    if [ "$VRAM_GB" -gt 50 ]; then
+    if [ "$VRAM_GB" -gt 90 ]; then
         MEM_ARGS=""
-        echo "💡 显存大于 50G，已自动省略 --mem-fraction-static 参数"
+        echo "💡 显存大于 90G，已自动省略 --mem-fraction-static 参数"
     elif [ "$VRAM_GB" -le 48 ]; then
         MEM_ARGS="--mem-fraction-static 0.6"
         echo "💡 显存判定结果：建议使用 0.6 显存配额"
+    elif [ "$VRAM_GB" -le 80 ]; then
+        MEM_ARGS="--mem-fraction-static 0.8"
+        echo "💡 显存判定结果：建议使用 0.8 显存配额"
     fi
 else
     echo "⚠️ 未检测到 nvidia-smi，将使用默认参数: --mem-fraction-static 0.8"
@@ -44,6 +47,9 @@ nohup sgl-omni serve \
   --port 8000 \
   > ./logs/server_$(date +%Y%m%d).log 2>&1 &
 set +x  # 关闭命令回显
+tail -f ./logs/server_$(date +%Y%m%d).log
 # tail -f ./logs/server_$(date +%Y%m%d).log
-# ps -ef | grep sgl-omni
-# pkill -f sgl-omni
+# ps -ef | grep sglang-omni
+# pkill -f sglang-omni
+# 重置指定ID的GPU，例如ID为0的GPU
+# sudo nvidia-smi --gpu-reset -i 0

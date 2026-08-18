@@ -22,6 +22,39 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
 
+# flash-attn-4 (CuTeDSL) moves varlen under flash_attn.cute. sglang 0.5.16's FA3
+# fallback (`from flash_attn import flash_attn_varlen_func`) only speaks classic
+# FA2's top-level API and raises ImportError on Blackwell, where FA3 kernels are
+# unsupported and the runtime falls back to FA2. Probe both paths up front so
+# import-time detection reflects what actually works at call time.
+try:
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_cute_varlen
+except ImportError:
+    _fa4_cute_varlen = None
+
+
+def _resolve_flash_attn_varlen():
+    """Pick a varlen kernel that actually works at call time on this device.
+
+    sglang's flash_attn_varlen_func lazily falls back to classic FA2 on non-Hopper
+    GPUs (e.g. Blackwell SM 12.0), and that lazy import fails when flash-attn-4 is
+    installed without classic flash-attn-2. Detect that by probing the FA2 symbol
+    flash_attn_varlen_func directly; if missing, prefer flash-attn-4's cute impl.
+    """
+    if flash_attn_varlen_func is None:
+        return _fa4_cute_varlen
+    try:
+        from flash_attn import flash_attn_varlen_func as _fa2_probe  # noqa: F401
+        return flash_attn_varlen_func
+    except ImportError:
+        if _fa4_cute_varlen is not None:
+            logger.info(
+                "sglang flash_attn_varlen_func FA2 fallback unavailable; "
+                "using flash-attn-4 cute varlen for MOSS packed flash attention."
+            )
+            return _fa4_cute_varlen
+        return None
+
 from sglang_omni.models.moss_tts.hf_loading import moss_transformers_processor_compat
 from sglang_omni.models.moss_tts.vocoder_kernels import (
     apply_exact_interleaved_rope_inplace,
@@ -457,7 +490,7 @@ class MossAudioTokenizerAttention(nn.Module):
         self._uses_v1_weights_attention_api = not hasattr(
             source, "resolve_attention_implementation"
         )
-        self._flash_attn_varlen = flash_attn_varlen_func
+        self._flash_attn_varlen = _resolve_flash_attn_varlen()
         max_period = self.rope.max_period if self.rope is not None else 10000.0
         self._packed_rope_cache = packed_rope_cache or _MossPackedRopeCache(
             max_period=max_period
