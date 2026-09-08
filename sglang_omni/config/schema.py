@@ -55,7 +55,7 @@ def stage_process_name(stage: "StageConfig") -> str:
 
 logger = logging.getLogger(__name__)
 
-MAX_SPEECH_INPUT_CHARS: int = 4096
+MAX_SPEECH_INPUT_CHARS: int = 35000  # 6k 长文本生产调参(上游默认 4096)
 
 
 def parse_memory_bytes(field_name: str, value: int | str | None) -> int | None:

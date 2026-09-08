@@ -18,7 +18,7 @@ from sglang.srt.utils.hf_transformers import (
     get_hf_text_config,
 )
 
-MOSS_TTS_DEFAULT_CONTEXT_LENGTH = 8192
+MOSS_TTS_DEFAULT_CONTEXT_LENGTH = 35000  # 6k 长文本生产调参(默认 8192)
 
 
 def _validate_context_length_metadata(text_config: Any) -> bool:
