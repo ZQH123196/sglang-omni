@@ -55,6 +55,7 @@ from sglang_omni.proto.admin import (
     ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
+    ADMIN_REQUEST_PROGRESS,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
     ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
@@ -2197,6 +2198,8 @@ class OmniScheduler:
             return self._admin_destroy_weights_update_group(payload)
         if action == ADMIN_WEIGHTS_CHECKER:
             return self._admin_weights_checker(payload)
+        if action == ADMIN_REQUEST_PROGRESS:
+            return self._admin_request_progress(payload)
         return {
             "success": True,
             "message": f"unsupported admin action: {action}",
@@ -2433,6 +2436,81 @@ class OmniScheduler:
         with self._admin_lock:
             data = self.model_worker.weights_checker(action)
         return {"success": True, "message": "ok", "data": data}
+
+    def _admin_request_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_ids = payload.get("request_ids")
+        if isinstance(raw_ids, (list, tuple)):
+            request_ids = [str(rid) for rid in raw_ids]
+        else:
+            request_ids = []
+        # Admin actions run on the scheduler thread when the loop is live, so
+        # reading the batch structures here races with nothing.
+        return {
+            "success": True,
+            "message": "ok",
+            "data": {
+                "requests": self.summarize_request_progress(
+                    request_ids,
+                    running_reqs=list(self.running_batch.reqs),
+                    queued_reqs=list(self.waiting_queue),
+                    aborted_ids=set(self._aborted_request_ids),
+                    completed_ids=set(self._completed_request_ids),
+                )
+            },
+        }
+
+    @staticmethod
+    def summarize_request_progress(
+        request_ids: list[str],
+        *,
+        running_reqs: list[Any],
+        queued_reqs: list[Any],
+        aborted_ids: set[str],
+        completed_ids: set[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Per-request token counters read off the engine-side ``Req`` objects.
+
+        ``completion_tokens`` is ``len(req.output_ids)``: the ground-truth
+        number of generated tokens so far. A caller compares it against a
+        text-length-derived budget to detect runaway generation.
+        """
+        running: dict[str, Any] = {}
+        for req in running_reqs:
+            rid = getattr(req, "rid", None)
+            if rid is not None:
+                running[str(rid)] = req
+        queued: dict[str, Any] = {}
+        for req in queued_reqs:
+            rid = getattr(req, "rid", None)
+            if rid is not None and str(rid) not in running:
+                queued[str(rid)] = req
+
+        entries: dict[str, dict[str, Any]] = {}
+        for rid in request_ids:
+            req = running.get(rid)
+            state: str | None = None
+            if req is not None:
+                state = "aborting" if rid in aborted_ids else "running"
+            else:
+                req = queued.get(rid)
+                if req is not None:
+                    state = "aborting" if rid in aborted_ids else "queued"
+                elif rid in completed_ids:
+                    state = "completed"
+                elif rid in aborted_ids:
+                    state = "aborting"
+            if req is None:
+                entries[rid] = {"state": state or "not_found"}
+                continue
+            prompt_tokens = len(getattr(req, "origin_input_ids", None) or [])
+            completion_tokens = len(getattr(req, "output_ids", None) or [])
+            entries[rid] = {
+                "state": state or "not_found",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        return entries
 
     def _abort_all_requests(self) -> int:
         request_ids = self._active_request_ids()

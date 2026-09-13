@@ -68,6 +68,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.proto.admin import ADMIN_REQUEST_PROGRESS
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
 )
@@ -295,6 +296,7 @@ def create_app(
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)
+    _register_requests(app)
     register_transcriptions(app)
     register_translations(app)
     if enable_realtime:
@@ -1276,13 +1278,68 @@ def _speech_generation_failure_response(
     return speech_error_response(mapped)
 
 
+def _register_requests(app: FastAPI) -> None:
+    @app.get("/v1/requests/{request_id}/progress")
+    async def request_progress(request_id: str) -> JSONResponse:
+        """Report token consumption for an in-flight request.
+
+        Counters come from the engine stage's scheduler via the
+        ``request_progress`` admin action; ``completion_tokens`` is the number
+        of tokens generated so far, so a caller can compare it against a
+        text-length-derived budget and disconnect to abort runaway requests.
+        """
+        client: Client = app.state.client
+        try:
+            result = await client.admin(
+                ADMIN_REQUEST_PROGRESS,
+                {"request_ids": [request_id]},
+                timeout_s=10.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "ServiceUnavailable",
+                        "message": str(exc),
+                    }
+                },
+            )
+
+        entries: dict[str, Any] = {}
+        for stage_result in result.get("results") or []:
+            data = stage_result.get("data") or {}
+            requests = data.get("requests")
+            if isinstance(requests, dict):
+                entries.update(requests)
+
+        info = entries.get(request_id)
+        if info is None:
+            state = client.get_status(request_id)
+            if state is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"request_id": request_id, "state": "not_found"},
+                )
+            info = {"state": state.value}
+        return JSONResponse(content={"request_id": request_id, **info})
+
+
 def _register_speech(app: FastAPI) -> None:
     @app.post("/v1/audio/speech")
     async def create_speech(request: Request) -> Response:
         client: Client = app.state.client
         speech_service: SpeechRequestValidator = app.state.speech_service
 
-        request_id = f"speech-{uuid.uuid4()}"
+        # A caller-supplied id (X-Request-Id) lets the caller correlate the
+        # request across connections: poll GET /v1/requests/{id}/progress from
+        # a side channel and disconnect this one to abort.
+        header_request_id = (request.headers.get("X-Request-Id") or "").strip()
+        if len(header_request_id) > 256:
+            return speech_error_response(
+                bad_request("X-Request-Id must be at most 256 characters")
+            )
+        request_id = header_request_id or f"speech-{uuid.uuid4()}"
         try:
             payload = await request.json()
             prepared = await asyncio.to_thread(
@@ -1342,6 +1399,7 @@ def _register_speech(app: FastAPI) -> None:
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
+            "X-Request-Id": request_id,
         }
         if result.finish_reason is not None:
             # note (Junnan Li): the body is binary audio, so the terminal state
