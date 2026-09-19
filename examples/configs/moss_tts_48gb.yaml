@@ -1,0 +1,11 @@
+# MOSS-TTS 48GB 显存配置（如 A6000 / RTX 6000 Ada）
+# 多进程布局下 engine 获得 ~34.5G 显存，可支撑少量并发。
+# 长文本场景建议客户端传 token_count 控制输出长度。
+config_cls: MossTTSPipelineConfig
+model_path: OpenMOSS-Team/MOSS-TTS-v1.5
+
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 8
+      max_prefill_tokens: 16384

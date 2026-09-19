@@ -8,7 +8,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from os import PathLike
+from os import PathLike, environ
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,7 +48,9 @@ from sglang_omni.models.weight_loader import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MOSS_TTS_AUDIO_TOKENIZER = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+DEFAULT_MOSS_TTS_AUDIO_TOKENIZER = environ.get(
+    "MOSS_TTS_AUDIO_TOKENIZER", "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+)
 DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
 _LOUDNESS_TARGET_DBFS = -20.0
 _LOUDNESS_GAIN_MIN_DB = -3.0
