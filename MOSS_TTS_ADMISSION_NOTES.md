@@ -87,13 +87,30 @@ if schedule_batch.is_prefill_only:
 
 | 场景 | 配置文件 | 关键参数 |
 |---|---|---|
-| H200 (90G+) | `moss_tts_prod.yaml` | max_running=64, prefill=35000 |
+| A100-80G / H100 / H200 (80G+) | `moss_tts_prod.yaml` | max_running=64, prefill=35000 |
 | A6000 (48G) | `moss_tts_48gb.yaml` | max_running=8, prefill=16384 |
 | RTX 5090 (32G) | `moss_tts_32gb.yaml`（上游） | single-process, concurrency=1 |
-| RTX 4090 (24G) | `moss_tts_24gb.yaml`（上游） | single-process, concurrency=1 |
+| RTX 4090 (24G) 及以下 | `moss_tts_24gb.yaml`（上游） | single-process, concurrency=1 |
+
+分档由 `start_tts.sh` 按 `nvidia-smi` 报的 **MiB** 判定：`>=80000` prod、`>=46000` 48gb、
+`>=30000` 32gb、其余 24gb。用 MiB 而不是 GB 是因为整除截断会把 80G 卡（81920 MiB）算成
+79/80 GB，从而误落到 48G 配置。
 
 ## 部署注意
 
 - 启动脚本 `start_tts.sh` 仅做环境准备 + `sgl-omni serve --config <选配的yaml>`
 - `MOSS_TTS_AUDIO_TOKENIZER` 环境变量指向本地 codec 权重目录（脚本中 export）
 - sglang 0.5.19+ 已原生支持所需 flash-attn 路径，旧 Blackwell 兼容 workaround 不再需要
+
+### 已核实事实：模型目录大小写不是问题，勿再上报
+
+- `start_tts.sh:42` 写的 `OpenMOSS-Team/Moss-TTS-v1.5` 与服务器上真实目录名一致。依据：该
+  脚本已用于生产部署并通过 6k 长文本并发测试（提交 `6be9e057b`）；若大小写对不上，加载
+  模型那一刻就会失败，跑不到并发。
+- `docs/cookbook` 与两份 YAML 里的 `MOSS-TTS-v1.5` 是 HuggingFace Hub 上的规范 repo id，
+  不是我们镜像到 `$MODEL_ROOT_DIR` 后的目录名。目录名由我们自己的下载方式决定。
+- YAML 的 `model_path` 在 `start_tts.sh` 这条启动路径上是死值，`--model-path` 覆盖它。
+  生效值与不生效值拼写不同，不构成缺陷。
+- 方法论约束（写给后续审查）：仓库里看不到那台服务器的文件系统。任何"路径大小写不匹配会
+  导致启动失败"的结论，必须以服务器 `ls` 的实际结果为依据；仅凭仓库内两处文本拼写不一致
+  就上报该问题，属于无效推断，不要再提。

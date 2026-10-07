@@ -16,16 +16,19 @@ source .venv/bin/activate
 # --- 按显存选择配置 ---
 if [ -z "$CONFIG" ]; then
     if command -v nvidia-smi &> /dev/null; then
-        VRAM_GB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
-        VRAM_GB=$((VRAM_GB / 1024))
-        echo "检测到 GPU 显存: ${VRAM_GB} GB"
+        # 按 MiB 整数比较,不换算成 GB:GB 除法会截断(81920 MiB → 79/80),
+        # 80G 卡会掉进 `-gt 80` 不成立而误选 48G 配置。
+        VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+        echo "检测到 GPU 显存: ${VRAM_MIB} MiB"
 
-        if [ "$VRAM_GB" -gt 80 ]; then
+        if [ "$VRAM_MIB" -ge 80000 ]; then
             CONFIG="examples/configs/moss_tts_prod.yaml"
-        elif [ "$VRAM_GB" -gt 32 ]; then
+        elif [ "$VRAM_MIB" -ge 46000 ]; then
             CONFIG="examples/configs/moss_tts_48gb.yaml"
-        else
+        elif [ "$VRAM_MIB" -ge 30000 ]; then
             CONFIG="examples/configs/moss_tts_32gb.yaml"
+        else
+            CONFIG="examples/configs/moss_tts_24gb.yaml"
         fi
     else
         echo "未检测到 nvidia-smi，使用 prod 配置"
@@ -35,13 +38,15 @@ fi
 echo "使用配置: $CONFIG"
 
 # --- 启动服务 ---
+# 不要加 --allowed-media-domain '*'：上游只支持精确域和 .后缀域，'*' 匹配不到任何
+# 域名，反而会让所有远程参考音频报 "Domain X is not allowed"。留空即为放行全部
+# （allow_remote_media_without_domains 默认 True，见 resource_connector.py:298）。
 mkdir -p ./logs
 LOG_FILE="./logs/server_$(date +%Y%m%d).log"
 
 nohup sgl-omni serve \
   --model-path "$MODEL_ROOT_DIR/OpenMOSS-Team/Moss-TTS-v1.5" \
   --config "$CONFIG" \
-  --allowed-media-domain '*' \
   --log-level debug \
   --port 8000 \
   > "$LOG_FILE" 2>&1 &
