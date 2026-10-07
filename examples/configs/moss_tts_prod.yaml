@@ -1,0 +1,13 @@
+# MOSS-TTS 生产部署配置（H200 / A100-80G 多进程布局）
+# 用法: sgl-omni serve --config examples/configs/moss_tts_prod.yaml ...
+#
+# 多进程架构下 mem_fraction_static 由 gpu_memory_fraction(0.72) 自动推导，
+# 无需手动指定；若需微调可在此显式覆盖。
+config_cls: MossTTSPipelineConfig
+model_path: OpenMOSS-Team/MOSS-TTS-v1.5
+
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 64
+      max_prefill_tokens: 35000

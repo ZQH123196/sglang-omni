@@ -51,7 +51,8 @@ else:
     pass
 
 
-MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
+MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 35000
+#MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
@@ -573,10 +574,47 @@ def prepare_moss_tts_request(
     )
 
 
+def _estimate_moss_tts_speech_frames(payload: StagePayload) -> tuple[str, int] | None:
+    """校验文本语言白名单并估算输出帧数(供准入预留用)。
+
+    白名单外的语言在此抛 ``UnsupportedLanguageError``(不支持语言报错反馈),
+    请求不会进入调度,不占用任何队列/池子资源。返回 ``(lang, frames)``;
+    文本为空时返回 ``None``(无需预留)。
+    """
+    from sglang_omni.models.moss_tts.speech_budget import (
+        UnsupportedLanguageError,
+        detect_language,
+        estimate_output_frames,
+        resolve_language,
+    )
+
+    inputs = payload.request.inputs or {}
+    text, _ = normalize_moss_tts_inputs(inputs)
+    if not text.strip():
+        return None
+    params = payload.request.params or {}
+    tts_params = (payload.request.metadata or {}).get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    # 剥掉 ${token:N} 前缀,避免把控制标记计入字符数。
+    text, _ = _resolve_token_count(text, params, tts_params)
+    # 显式 language 参数优先;未指定则按文本字符检测(白名单外都抛不支持语言)。
+    language = _resolve_optional_text(
+        tts_params.get("language") or params.get("language")
+    )
+    if language is not None:
+        lang = resolve_language(language)
+    else:
+        lang = detect_language(text)
+    return lang, estimate_output_frames(text, lang)
+
+
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     """Run MOSS-TTS prompt/reference preprocessing outside the AR scheduler."""
 
     rid = str(payload.request_id)
+    speech_estimate = _estimate_moss_tts_speech_frames(payload)
+    speech_lang, speech_frames = (speech_estimate or (None, None))
     context = _QUEUE.begin(rid)
     if context is None:
         raise RuntimeError(
@@ -605,6 +643,10 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
         data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
     else:
         pass
+    if speech_frames is not None:
+        data["_moss_speech_frames"] = speech_frames
+    if speech_lang is not None:
+        data["_moss_speech_lang"] = speech_lang
     return StagePayload(
         request_id=payload.request_id, request=payload.request, data=data
     )
@@ -888,6 +930,8 @@ def build_sglang_moss_tts_request(
         req.extra_key
     )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     req._codec_suppress_tokens = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req._moss_speech_frames = payload.data.get("_moss_speech_frames")
+    req._moss_speech_lang = payload.data.get("_moss_speech_lang")
 
     data = MossTTSSGLangRequestData(
         input_ids=prepared.input_ids,
@@ -933,6 +977,17 @@ def apply_sglang_moss_tts_result(
     data: MossTTSSGLangRequestData,
 ) -> StagePayload:
     state = data.state
+    # 请求完成回喂语速标定器:(输入字符数, 实际生成帧数),口径与估算一致。
+    # 仅在正常生成(有输出帧)时统计;失败/0 帧请求不参与,避免污染均值。
+    speech_lang = payload.data.get("_moss_speech_lang")
+    if speech_lang is not None and data.output_rows:
+        from sglang_omni.models.moss_tts.speech_budget import calibrator
+
+        calibrator.observe(
+            speech_lang,
+            len(state.text or ""),
+            len(data.output_rows),
+        )
     if data.assistant_prefix_rows is None:
         assistant_prefix_rows = torch.empty((0, 0), dtype=torch.long)
     else:
