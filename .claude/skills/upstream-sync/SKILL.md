@@ -12,12 +12,12 @@ description: 把 main 更新到最新上游、把 my-deploy 部署层重放到�
 | `upstream` | sgl-project/sglang-omni | 只读来源，禁止向其推送 |
 | `origin` | 自己的 fork (ZQH123196) | `main` 只是镜像，`my-deploy` 才是工作分支 |
 | `main` | 上游镜像 | **永远不含本地提交**，只能 `merge --ff-only upstream/main` |
-| `my-deploy` | 部署层分支 | **恒为 main + 1 个压缩提交**，不带自己的多条历史 |
+| `my-deploy` | 部署层分支 | 同步后为 **main + 1 个压缩提交**；两次同步之间可追加部署修正提交，下次同步时一并压入 |
 
 不变式（每次同步后自检）：
 
 ```bash
-git log --oneline main..my-deploy   # 必须恰好 1 条
+git log --oneline main..my-deploy   # 同步刚完成时恰好 1 条
 git status --short                  # 必须为空
 ```
 
@@ -110,6 +110,7 @@ git push --force-with-lease origin my-deploy
 ## 已知现象
 
 - `git fetch upstream` 会打印 `files` backend / 无法存引用 的警告，属正常，只影响个别远端分支引用，不影响 `upstream/main`。
+- `start_tts.sh` 不做 `git pull`：部署机若在启动时拉取，压缩重写的历史会让 pull 撞分叉。同步一律人工执行。
 - `CLAUDE.md` 是 `AGENTS.md` 的软链，改其一即可。
 - backup tag 命名沿用 `backup/my-deploy-YYYYMMDD`，仓库里已有 `20261007` / `20261017` / `20261022`。
 

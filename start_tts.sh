@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-git pull
-# 使用清华镜像源进行同步
-uv sync --index https://pypi.tuna.tsinghua.edu.cn/simple
 # MOSS-TTS 生产启动脚本
+# 代码同步不在这里做:my-deploy 是压缩重写的历史,启动时 git pull 会撞分叉。
+# 需要同步时人工执行,见 .claude/skills/upstream-sync/SKILL.md。
 # 自动检测 GPU 显存选择对应配置文件，也可手动覆盖: CONFIG=xxx bash start_tts.sh
 
 # --- 环境准备 ---
@@ -14,6 +13,8 @@ export MODEL_ROOT_DIR="/root/autodl-fs/models"
 export MOSS_TTS_AUDIO_TOKENIZER="$MODEL_ROOT_DIR/OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
 cd "$MyWorkDir/sglang-omni"
+# 依赖同步(清华镜像)。必须在 cd 之后执行,否则 uv 作用在调用者的 cwd 上。
+uv sync --index https://pypi.tuna.tsinghua.edu.cn/simple
 source .venv/bin/activate
 
 # --- 按显存选择配置 ---
