@@ -1,13 +1,15 @@
 # MOSS-TTS 生产部署配置（H200 / A100-80G 多进程布局）
 # 用法: sgl-omni serve --config examples/configs/moss_tts_prod.yaml ...
 #
-# 多进程架构下 mem_fraction_static 由 gpu_memory_fraction(0.72) 自动推导，
-# 无需手动指定；若需微调可在此显式覆盖。
+# gpu_memory_fraction 显式钉在 0.60：上游 #2859 把 AR 预算从 0.72 降到 0.60，
+# 给图捕获腾 headroom（prefill 精确长度 1-512 + vocoder 单段 ≤128 帧）。
+# 显式写死是为了不随上游默认值漂移；80G 卡上 0.60 ≈ 48G KV。
 config_cls: MossTTSPipelineConfig
 model_path: OpenMOSS-Team/MOSS-TTS-v1.5
 
 stages:
   tts_engine:
+    gpu_memory_fraction: 0.60
     engine:
       max_running_requests: 64
       max_prefill_tokens: 35000

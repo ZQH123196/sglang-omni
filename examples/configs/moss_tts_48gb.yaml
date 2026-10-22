@@ -1,11 +1,15 @@
 # MOSS-TTS 48GB 显存配置（如 A6000 / RTX 6000 Ada）
-# 多进程布局下 engine 获得 ~34.5G 显存，可支撑少量并发。
+# gpu_memory_fraction 0.60 → engine 约 28.8G（0.60 × 48G），与上游 #2859 默认一致。
+# 注意：本档并发仅 8，吃不到 #2859 的 lookahead 收益（batch ≥2 才生效，并发越高
+# 越明显），却同样承受 KV −17% 与启动 +40s/+3.7GiB。若出现频繁 defer，优先考虑
+# 关 prefill 图并把预算恢复 0.72，见 MOSS_TTS_ADMISSION_NOTES.md。
 # 长文本场景建议客户端传 token_count 控制输出长度。
 config_cls: MossTTSPipelineConfig
 model_path: OpenMOSS-Team/MOSS-TTS-v1.5
 
 stages:
   tts_engine:
+    gpu_memory_fraction: 0.60
     engine:
       max_running_requests: 8
       max_prefill_tokens: 16384

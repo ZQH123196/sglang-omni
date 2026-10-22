@@ -33,16 +33,53 @@
 # examples/configs/moss_tts_prod.yaml
 stages:
   tts_engine:
+    gpu_memory_fraction: 0.60
     engine:
       max_running_requests: 64
       max_prefill_tokens: 35000
 ```
 
+- `gpu_memory_fraction`：AR 阶段能占整卡的比例，决定 KV 池大小，也是账本的分母；显式写死，不依赖上游默认
 - `max_running_requests`：引擎调度池大小，决定最大同时 in-flight 请求数
 - `max_prefill_tokens`：允许一次 prefill 消化多少 token（6K 中文 ≈ 6K-12K tokens + ref audio）
 - `context_length`：由模型 metadata 自动推导（32768），无需覆盖
 
 `MOSS_TTS_DEFAULT_MAX_NEW_TOKENS=35000`（request_builders.py）：当客户端不传 `max_new_tokens` 时的生成帧上限。6K 中文字在 25fps 下约需 37500 帧，所以天花板必须 ≥ 文本预估帧数。若客户端总传 `token_count` 则可降回 4096。
+
+### 显存预算与上游 #2859 的默认值（2026-10-22 起）
+
+colocated 布局分三段预算：preprocessing `0.10` + AR `0.60` + vocoder `0.18` = `0.88`，剩 12% 留给图捕获与激活。
+
+上游 `#2859`（`53ea26787`，随 2026-10-22 同步进入）同时改了四件事：AR 预算 `0.72 → 0.60`、
+MOSS factory 默认开 async decode（batch ≥2 生效、`async_decode_mode: nonstream`）、
+colocated 下 prefill 精确长度图 1–512、vocoder 单段图 ≤128 帧。
+
+**我们的取舍：三项默认全保留，0.60 显式钉进两份 YAML。** 依据是本仓库的生产场景就是高并发非流式，
+正好落在该 PR 收益最大的一档（H100 实测非流式 c64 吞吐 21.63 → 34.38 req/s，+58.9%；c1 仅 +10%）。
+代价同源：启动 +40s、峰值显存 +3.7GiB、图捕获从 152 涨到 19236 次（每个 prefill 长度一张图）。
+
+容量变化（账本的分母）：
+- 80G 卡：AR `0.72 × 80 = 57.6G` → `0.60 × 80 = 48.0G`
+- 48G 卡：`34.6G` → `28.8G`
+
+账本按池子实时余额放行，池子缩小**不会溢出**，但会直接表现为 `speech-admit defer` 变多、排队变长。
+`max_running_requests`（64 / 8）与语速表、`SAFETY_FACTOR` 是按旧池子调的，缩池后需复测。
+
+**若某档要换回容量**：只关图不会自动回到 0.72，必须两者都改。
+
+```yaml
+stages:
+  tts_engine:
+    gpu_memory_fraction: 0.72
+    engine:
+      cuda_graph_backend_prefill: disabled
+```
+
+48G 档并发仅 8，吃不到 lookahead 收益却同样付容量与启动成本；该档出现频繁 defer 时应优先走上面这条。
+
+**不用担心的**：lookahead 让 `len(req.output_ids)` 落后半步，账本 `remaining = 估算 − 已解码`
+因此每请求多留约 1 帧，方向保守（64 并发合计 ≈64 token）；`nonstream` 模式下流式与混合批次
+完全同步，流式延迟曲线不变。
 
 ### 第二层：准入控制（omni_scheduler + speech_budget）
 
@@ -111,8 +148,8 @@ if schedule_batch.is_prefill_only:
 
 | 场景 | 配置文件 | 关键参数 |
 |---|---|---|
-| A100-80G / H100 / H200 (80G+) | `moss_tts_prod.yaml` | max_running=64, prefill=35000 |
-| A6000 (48G) | `moss_tts_48gb.yaml` | max_running=8, prefill=16384 |
+| A100-80G / H100 / H200 (80G+) | `moss_tts_prod.yaml` | gpu_fraction=0.60, max_running=64, prefill=35000 |
+| A6000 (48G) | `moss_tts_48gb.yaml` | gpu_fraction=0.60, max_running=8, prefill=16384 |
 | RTX 5090 (32G) | `moss_tts_32gb.yaml`（上游） | single-process, concurrency=1 |
 | RTX 4090 (24G) 及以下 | `moss_tts_24gb.yaml`（上游） | single-process, concurrency=1 |
 
