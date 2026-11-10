@@ -32,6 +32,12 @@ from sglang_omni.models.moss_tts.payload_types import (
     resolve_moss_audio_pad_code,
 )
 from sglang_omni.models.moss_tts.reference_encoder import MossReferenceEncoder
+from sglang_omni.models.moss_tts.speech_budget import (
+    calibrator,
+    detect_language,
+    estimate_output_frames,
+    resolve_language,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_seed
 from sglang_omni.scheduling.message import OutgoingMessage
@@ -47,7 +53,7 @@ else:
     pass
 
 
-MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
+MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 35000
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
@@ -567,10 +573,49 @@ def prepare_moss_tts_request(
     )
 
 
+def estimate_moss_tts_speech_budget(payload: StagePayload) -> tuple[str, int] | None:
+    """Check the text against the language whitelist and estimate its output frames.
+
+    Languages off the whitelist raise UnsupportedLanguageError here, so the request
+    never reaches scheduling and holds no queue or pool resource. Empty text returns
+    None. The language feeds the speech-rate calibrator on completion, and the frame
+    estimate is what the scheduler's KV reservation ledger bills against.
+    """
+    inputs = payload.request.inputs or {}
+    text, _ = normalize_moss_tts_inputs(inputs)
+    if not text.strip():
+        return None
+    else:
+        pass
+    params = payload.request.params or {}
+    tts_params = (payload.request.metadata or {}).get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    else:
+        pass
+    # Drop the token:N prefix so control markers do not count as text length.
+    text, _ = resolve_token_count(text, params, tts_params)
+    # An explicit language argument wins; otherwise detect from the text.
+    language = resolve_optional_text(
+        tts_params.get("language") or params.get("language")
+    )
+    if language is not None:
+        lang = resolve_language(language)
+    else:
+        lang = detect_language(text)
+    return lang, estimate_output_frames(text, lang)
+
+
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     """Run MOSS-TTS prompt/reference preprocessing outside the AR scheduler."""
 
     rid = str(payload.request_id)
+    speech_budget = estimate_moss_tts_speech_budget(payload)
+    if speech_budget is None:
+        speech_lang = None
+        speech_frames = None
+    else:
+        speech_lang, speech_frames = speech_budget
     context = _QUEUE.begin(rid)
     if context is None:
         raise RuntimeError(
@@ -597,6 +642,14 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     data = prepared.state.to_dict()
     if published:
         data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
+    else:
+        pass
+    if speech_lang is not None:
+        data["_moss_speech_lang"] = speech_lang
+    else:
+        pass
+    if speech_frames is not None:
+        data["_moss_speech_frames"] = speech_frames
     else:
         pass
     return StagePayload(
@@ -882,6 +935,9 @@ def build_sglang_moss_tts_request(
         req.extra_key
     )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     req._codec_suppress_tokens = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req._moss_speech_frames = payload.data.get(
+        "_moss_speech_frames"
+    )  # noqa: leading-underscore  # billed by the scheduler KV reservation ledger
 
     data = MossTTSSGLangRequestData(
         input_ids=prepared.input_ids,
@@ -927,6 +983,17 @@ def apply_sglang_moss_tts_result(
     data: MossTTSSGLangRequestData,
 ) -> StagePayload:
     state = data.state
+    # Feed the calibrator (input characters, generated frames) per completed request.
+    # Failed and zero-frame requests are skipped so they cannot skew the mean.
+    speech_lang = payload.data.get("_moss_speech_lang")
+    if speech_lang is not None and data.output_rows:
+        calibrator.observe(
+            speech_lang,
+            len(state.text or ""),
+            len(data.output_rows),
+        )
+    else:
+        pass
     if data.assistant_prefix_rows is None:
         assistant_prefix_rows = torch.empty((0, 0), dtype=torch.long)
     else:

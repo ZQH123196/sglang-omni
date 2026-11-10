@@ -27,7 +27,7 @@ from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
-from typing import Callable, Generic, Literal
+from typing import Any, Callable, Generic, Literal
 
 import sglang.srt.runtime_context as runtime_context
 import torch
@@ -151,6 +151,9 @@ _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
 _IDLE_WAIT_S = 0.02
 MAX_STREAM_ALLOCATION_ATTEMPTS = 65
+
+# rebalance 放不回时的重试宽限:KV 释放可能延迟,3s 内不重算,给池子时间。
+_REBALANCE_RETRY_INTERVAL_S = 3.0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -584,6 +587,15 @@ class OmniScheduler(Generic[RequestDataT]):
 
         # Batch state
         self.waiting_queue: list = []
+        # Speech capacity admission (MOSS-TTS): requests whose estimated peak
+        # KV footprint exceeds the pool's available space are moved here from
+        # waiting_queue so the pool fills by queuing, not by upstream retract.
+        # See get_new_batch_prefill / _defer_unadmittable_prefill_requests.
+        self._speech_deferred: list = []
+        self._speech_admit_banner_logged: bool = False
+        self._speech_admit_no_estimate_logged: bool = False
+        self._speech_admit_init_fallback_logged: bool = False
+        self._speech_admit_rebalance_retry_ts: float = 0.0
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -2232,6 +2244,234 @@ class OmniScheduler(Generic[RequestDataT]):
             )
         )
 
+    def _speech_deferred_queue(self) -> list:
+        return getattr(self, "_speech_deferred", [])
+
+    def _speech_running_committed_future(self) -> int:
+        """已运行请求"还没长完"的输出帧承诺总和。
+
+        每个 running 请求的估算输出帧数(``_moss_speech_frames``)减去已生成
+        帧数(``len(req.output_ids)``),剩下的就是它未来 decode 还要占用池子
+        的量。``pool.available_size()`` 已含它们当前已分配的部分,所以准入时
+        只扣这个"未来还要长出来的"部分,避免与已分配量重复计算。
+
+        推导:effective_free = available - Σ(remaining_output_i)
+                            = total - Σ(allocated_i) - Σ(estimated_output_i - decoded_i)
+                            = total - Σ(allocated_input_i + estimated_output_i)
+                            = total - Σ(running 请求峰值足迹)
+
+        无估算的 running 请求不计入(无法预判),由调用方日志暴露。
+        """
+        running_batch = self.running_batch
+        if not running_batch or not running_batch.reqs:
+            return 0
+        committed = 0
+        for req in running_batch.reqs:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                continue
+            decoded_so_far = len(req.output_ids)
+            remaining = int(estimated_output) - decoded_so_far
+            if remaining > 0:
+                committed += remaining
+        return committed
+
+    def _speech_admit_input_increment(self, req: Any) -> int:
+        """radix 命中后输入真实增量;失败回退全量(行为退化为现状)。
+
+        旧尺子用 ``len(req.origin_input_ids)`` 全量算输入,但同文本并发时
+        输入 KV 大部分被 radix 共享(实测 3910 输入里 3909 命中),实际只
+        新增 1 token,尺子超卖预留 3909 倍,池子剩 37% 空也判"放不下",
+        峰值卡 0.63。
+
+        修复:主动调 ``req.init_next_round_input()``(SGLang Req 自带方法,
+        上游 prefill 本就要调,这里提前调一次),让它算 radix、把真实增量
+        填到 ``req.extend_range.length``。尺子读这个字段替代全长。
+
+        不动上游源码,只在 fork 里调现成方法。失败/无方法回退全长,
+        行为退化为现状,不会更糟。
+        """
+        init = getattr(req, "init_next_round_input", None)
+        if not callable(init):
+            return len(req.origin_input_ids)
+        try:
+            init()
+        except Exception as error:
+            if not self._speech_admit_init_fallback_logged:
+                self._speech_admit_init_fallback_logged = True
+                logger.info(
+                    f"speech-admit 输入增量计算失败,回退全量输入:"
+                    f"请求={getattr(req, 'rid', '?')},原因={error!r};该提示只打一次",
+                    exc_info=True,
+                )
+            else:
+                pass
+            return len(req.origin_input_ids)
+        ext = getattr(req, "extend_range", None)
+        if ext is None:
+            return len(req.origin_input_ids)
+        length = int(getattr(ext, "length", 0) or 0)
+        return max(1, length)  # radix 全命中时为 0,兜底 1
+
+    def _speech_effective_free(self) -> tuple[int, int, int]:
+        """返回 (pool_available, running_committed_future, effective_free)。
+
+        effective_free = pool_available - running_committed_future,即扣除已运行
+        请求未来增长后、真正还能接纳新请求峰值的空闲量。这是守门的正确尺子。
+        """
+        pool = self.token_to_kv_pool_allocator
+        pool_available = pool.available_size()
+        running_committed_future = self._speech_running_committed_future()
+        effective_free = pool_available - running_committed_future
+        return pool_available, running_committed_future, effective_free
+
+    def _rebalance_speech_deferred(self) -> None:
+        """把池子已释放、现在放得下的 deferred 请求放回 waiting_queue。
+
+        KV 释放可能有延迟:请求完成/abort 后 pool.available_size() 不一定
+        立刻反映释放结果。因此放不回时不每轮重算(浪费且刷屏),而是记下
+        上次尝试时间,>= REBALANCE_RETRY_INTERVAL(3s) 才再算一次,给 pool
+        释放宽限期。日志纯事件驱动:只在真有请求放回时打 INFO。
+        """
+        deferred = getattr(self, "_speech_deferred", None)
+        if not deferred:
+            return
+        # 宽限节流:距上次"放不回"尝试不足 3s 则跳过,给 KV 释放时间,也避免
+        # 每轮重算+刷屏。一旦放回请求则立即清零时间戳(下一轮无宽限,趁热放)。
+        now = time.monotonic()
+        last_ts = getattr(self, "_speech_admit_rebalance_retry_ts", 0.0)
+        if last_ts and now - last_ts < _REBALANCE_RETRY_INTERVAL_S:
+            return
+
+        pool_available, running_committed_future, effective_free = (
+            self._speech_effective_free()
+        )
+        initial_effective_free = effective_free
+        back: list = []
+        stay: list = []
+        for req in deferred:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                # 无估算的请求本不该被 defer,放回让其走上游正常路径。
+                back.append(req)
+                continue
+            peak_footprint = self._speech_admit_input_increment(req) + int(estimated_output)
+            if effective_free >= peak_footprint:
+                back.append(req)
+                effective_free -= peak_footprint  # 串行预留,防同批超卖
+            else:
+                stay.append(req)
+        if back:
+            self.waiting_queue = back + self.waiting_queue
+            self._speech_admit_rebalance_retry_ts = 0.0  # 放回了,清宽限
+            logger.info(
+                f"speech-admit 归还:{len(back)} 个请求放回等待队列,"
+                f"仍延迟={len(stay)},池空闲={pool_available},"
+                f"在途承诺={running_committed_future},"
+                f"初始预算={initial_effective_free},归还后剩余={effective_free}"
+            )
+        else:
+            # 放不回:记下时间戳,3s 内不再重算(给 KV 释放宽限,且不刷屏)。
+            self._speech_admit_rebalance_retry_ts = now
+        self._speech_deferred = stay
+
+    def _defer_unadmittable_prefill_requests(self) -> None:
+        """容量准入(预留制):按峰值足迹预留池子,放不下就推迟。
+
+        准入目的:池子永不溢出、上游 retract 永不触发。手段 = 只在请求的
+        "峰值足迹"(输入实长 + 估算输出帧)放得下时才放行,短文本秒进、长文本
+        排队等释放。
+
+        守门尺子必须扣两项,否则会超卖(每个单独看放得下、加起来超池子):
+        (1) 已运行请求"还没长完"的输出帧(它们还会继续 decode 占池子),
+            由 :meth:`_speech_running_committed_future` 计算;
+        (2) 本次循环里已放行请求的峰值(串行预留,防同一批超卖)。
+
+        输入部分用 :meth:`_speech_admit_input_increment` 而非
+        ``len(req.origin_input_ids)`` 全量:radix 命中后输入新增接近 0
+        (同文本并发时 3910 输入里 3909 共享),按全量算尺子超卖预留
+        3909 倍,池子剩 37% 空也判"放不下",峰值卡 0.63。该方法主动调
+        ``req.init_next_round_input()`` 拿 ``req.extend_range.length``
+        (radix 后真实增量),失败回退全量(行为退化为旧尺子)。输出帧
+        每请求独立 KV 无共享,``estimated_output`` 必须保留全量。
+
+        正常 prefill 准入由上游 Scheduler 处理(0.5.16 不用 fork 的
+        PrefillManager),这里在委托上游前把放不下的从 waiting_queue 挪到
+        私有 deferred 队列;池子释放后由 :meth:`_rebalance_speech_deferred`
+        放回。无估算的请求(非 MOSS / preprocess 未挂字段)无法预判,放行但
+        由日志暴露——若全部请求都无估算,准入等于没设卡。
+        """
+        if not self._speech_admit_banner_logged:
+            self._speech_admit_banner_logged = True
+            logger.info(
+                f"speech-admit 容量准入已启用:"
+                f"并发上限={self.max_running_requests},"
+                f"入口=get_new_batch_prefill 前置钩子"
+            )
+        if not self.waiting_queue:
+            return
+
+        pool_available, running_committed_future, effective_free = (
+            self._speech_effective_free()
+        )
+        deferred = self._speech_deferred_queue()
+        kept: list = []
+        reqs_with_estimate = 0
+        reqs_without_estimate = 0
+        sample_peak_footprint = None
+        sample_deferred_request_id = None
+        newly_deferred = 0
+        for req in self.waiting_queue:
+            estimated_output = getattr(req, "_moss_speech_frames", None)
+            if estimated_output is None:
+                reqs_without_estimate += 1
+                kept.append(req)
+                continue
+            reqs_with_estimate += 1
+            peak_footprint = self._speech_admit_input_increment(req) + int(estimated_output)
+            if sample_peak_footprint is None:
+                sample_peak_footprint = peak_footprint
+            if effective_free >= peak_footprint:
+                kept.append(req)
+                effective_free -= peak_footprint  # 串行预留,防同批超卖
+            else:
+                deferred.append(req)
+                newly_deferred += 1
+                if sample_deferred_request_id is None:
+                    sample_deferred_request_id = getattr(req, "rid", "?")
+        self.waiting_queue = kept
+        self._speech_deferred = deferred
+
+        if newly_deferred > 0:
+            logger.info(
+                f"speech-admit 延迟:{newly_deferred} 个请求移入延迟队列,"
+                f"等待队列={len(kept)},延迟队列={len(deferred)},"
+                f"池空闲={pool_available},在途承诺={running_committed_future},"
+                f"初始预算={pool_available - running_committed_future},"
+                f"剩余预算={effective_free},样本峰值={sample_peak_footprint},"
+                f"样本请求={sample_deferred_request_id},"
+                f"有估算={reqs_with_estimate},无估算={reqs_without_estimate}"
+            )
+
+        # 估算缺失检测(状态转换时打一次,非定时):若所有 waiting 请求都没有
+        # _moss_speech_frames 估算,说明 preprocess 没挂字段,准入对这些请求
+        # 等于没设卡——这是"为什么还在 retract"的关键诊断信号。
+        all_without_estimate = (
+            reqs_with_estimate == 0 and reqs_without_estimate > 0
+        )
+        if all_without_estimate and not self._speech_admit_no_estimate_logged:
+            self._speech_admit_no_estimate_logged = True
+            logger.info(
+                f"speech-admit 缺少估算:{reqs_without_estimate} 个等待请求"
+                f"没有 _moss_speech_frames,准入无法约束(preprocess 未挂字段?);"
+                f"池空闲={pool_available},在途承诺={running_committed_future},"
+                f"可用预算={pool_available - running_committed_future}"
+            )
+        elif not all_without_estimate:
+            self._speech_admit_no_estimate_logged = False
+        else:
+            pass
+
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         """Keep batch ownership in Omni while borrowing native batch selection."""
         for attempt in range(2 if self.enable_plain_fallback else 1):
@@ -2598,6 +2838,10 @@ class OmniScheduler(Generic[RequestDataT]):
         #
         # Upstream passes running_batch in and expects a NextBatchPlan back,
         # so the coalesce hold-off returns an empty plan rather than None.
+        # Both get_new_batch_prefill paths converge here after the upstream split.
+        # Deploy ledger first: deferral shrinks the queue the deadline below measures.
+        self._rebalance_speech_deferred()
+        self._defer_unadmittable_prefill_requests()
         waiting = self.prefill_coalesce_waiting_requests(running_batch)
         if waiting is None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
@@ -3584,6 +3828,10 @@ class OmniScheduler(Generic[RequestDataT]):
             pass
         self.pending_stream_ingress.pop(request_id, None)
         self.deferred_request_payloads.pop(request_id, None)
+        if getattr(self, "_speech_deferred", None):
+            self._speech_deferred = [
+                req for req in self._speech_deferred if req.rid != request_id
+            ]
         self.dirty_deferred_request_ids.discard(request_id)
         self.first_emit_done.discard(request_id)
         # Note: (Jiaxin Deng) emit before discarding, and discard whether or

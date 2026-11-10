@@ -17,6 +17,7 @@ is imported by `sglang_omni/`, and no CI job runs them.
 
 | Skill | What it does | Who can run it |
 |---|---|---|
+| [`upstream-sync`](upstream-sync/SKILL.md) | Fast-forwards `main` to `upstream/main`, then replays the `my-deploy` deployment layer as one squashed commit on top of it, with pre-flight merge checks and post-replay wiring checks. Tags a backup branch before rewriting history. | Anyone maintaining the `my-deploy` deployment branch. Needs `upstream` remote. |
 | [`running-eval-suite`](running-eval-suite/SKILL.md) | Reruns every reference benchmark under `benchmarks/eval/` and rewrites the reference-table cells in `benchmark_*.py` for the hardware it detects. Commits locally, never pushes. | Any sglang-omni dev container with free GPUs and the `omni` venv. |
 
 The evaluation skill expects the CI-equivalent environment (the `omni` venv,
