@@ -66,7 +66,10 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
-from sglang_omni.models.moss_tts.speech_budget import theoretical_peak_limit
+from sglang_omni.models.moss_tts.speech_budget import (
+    safety_factor,
+    theoretical_peak_limit,
+)
 from typing_extensions import TypedDict
 
 from sglang_omni.admission import (
@@ -151,6 +154,9 @@ _COMPLETED_REQUEST_ID_LIMIT = 10000
 _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
 _IDLE_WAIT_S = 0.02
+# 容量准入日志的最小间隔(秒)。暂缓状态稳定时完全不打,只在状态翻转或
+# 排队数变化且超过该间隔时打一条,避免每个调度轮次(~20ms)刷一条 INFO。
+_SPEECH_ADMIT_LOG_INTERVAL_S = 5.0
 MAX_STREAM_ALLOCATION_ATTEMPTS = 65
 
 
@@ -590,6 +596,9 @@ class OmniScheduler(Generic[RequestDataT]):
         self._speech_admit_banner_logged: bool = False
         self._speech_admit_no_estimate_logged: bool = False
         self._speech_admit_init_fallback_logged: bool = False
+        # 暂缓日志去重:记录上一轮暂缓数与上次打印时间,稳定态不刷屏。
+        self._speech_admit_last_held: int = 0
+        self._speech_admit_last_log_ts: float = 0.0
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.cur_batch = None
         self.last_batch = None
@@ -2324,24 +2333,32 @@ class OmniScheduler(Generic[RequestDataT]):
     def _speech_admit_usage_text(
         self, available: int, running_committed_future: int
     ) -> str:
-        """把 KV 池占用换算成 0-1 比例,口径对齐上游 metrics 的 token usage。
+        """把准入账本换算成"真实占用"口径的 0-1 比例,便于和 token usage 对照。
 
-        预计占用 = (不可回收占用 + running 请求未来还要长出来的输出帧) / 池总量
-                 = (total - 可用空间 + running_committed_future) / total
-                 = (total - effective_free) / total
+        账本值 = (不可回收占用 + running 请求未来还要长出来的输出帧) / 池总量
+               = (total - 可用空间 + running_committed_future) / total
+               = (total - effective_free) / total
 
-        可用空间含 radix cache 可驱逐部分(见 _speech_effective_free),口径
-        与上游 metrics 的 token usage 对齐;>1.00 表示超卖。
+        注意:这里不是上游 metrics 的 token usage。估算输出帧由
+        ``estimate_output_frames()`` 给出、已乘 ``safety_factor()`` 放大,
+        所以账本值的上限是 1.00(准入规则本来就是"把账本填满到 1.00"),
+        把 0.99 当成真实占用率会误判成超卖。
+
+        因此统一除以 ``safety_factor()`` 换算回真实口径,才能和
+        ``theoretical_peak_limit() = 1/safety_factor()``、以及上游
+        ``token usage`` 直接比较。输入增量经 radix 共享后占比很小,
+        忽略其"未放大"带来的偏差。
         """
         pool = self.token_to_kv_pool_allocator
         total = int(getattr(pool, "size", 0) or 0)
         if total <= 0:
             total = int(getattr(self, "max_total_num_tokens", 0) or 0)
         if total <= 0:
-            return f"预计占用=n/a,理论峰值上限={theoretical_peak_limit():.2f}"
+            return f"预计真实占用=n/a,理论峰值上限={theoretical_peak_limit():.2f}"
         projected = total - available + running_committed_future
+        real = projected / safety_factor() / total
         return (
-            f"预计占用={projected / total:.2f},"
+            f"预计真实占用={real:.2f},"
             f"理论峰值上限={theoretical_peak_limit():.2f}"
         )
 
@@ -2363,9 +2380,8 @@ class OmniScheduler(Generic[RequestDataT]):
                 f"并发上限={self.max_running_requests},"
                 f"入口=get_new_batch_prefill 前置钩子"
             )
-        if not self.waiting_queue:
-            return [], []
-
+        # 空队列也走完整流程:这样暂缓状态能正常归零(否则队列一空就跳过,
+        # 下次有请求时 prev_held 还停在旧值,解除事件会丢)。
         available, committed, budget = self._speech_effective_free()
         admitted: list = []
         held: list = []
@@ -2392,11 +2408,30 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 held.append(req)
 
-        if held:
-            logger.info(
-                f"speech-admit 暂缓:{len(held)} 个请求本轮不参与调度,"
-                f"{self._speech_admit_usage_text(available, committed)}"
-            )
+        # 事件驱动日志:本方法每轮调度都会跑(~20ms),稳定态下 held 非空且
+        # 数量不变时一条都不打。只在"开始/解除暂缓"时立刻打,其余数量变化
+        # 最多每 _SPEECH_ADMIT_LOG_INTERVAL_S 打一条慢速心跳。
+        held_count = len(held)
+        prev_held = self._speech_admit_last_held
+        state_flip = (held_count == 0) != (prev_held == 0)
+        now = time.monotonic()
+        if state_flip or (
+            held_count != prev_held
+            and now - self._speech_admit_last_log_ts >= _SPEECH_ADMIT_LOG_INTERVAL_S
+        ):
+            self._speech_admit_last_log_ts = now
+            if held_count:
+                logger.info(
+                    f"speech-admit 暂缓:{held_count} 个请求本轮不参与调度,"
+                    f"{self._speech_admit_usage_text(available, committed)}"
+                )
+            else:
+                logger.info(
+                    "speech-admit 暂缓解除,"
+                    f"{self._speech_admit_usage_text(available, committed)}"
+                )
+        self._speech_admit_last_held = held_count
+
         all_without_estimate = with_estimate == 0 and without_estimate > 0
         if all_without_estimate and not self._speech_admit_no_estimate_logged:
             self._speech_admit_no_estimate_logged = True
