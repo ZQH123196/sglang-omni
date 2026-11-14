@@ -11,5 +11,5 @@ stages:
   tts_engine:
     gpu_memory_fraction: 0.60
     engine:
-      max_running_requests: 64
+      max_running_requests: 128
       max_prefill_tokens: 35000

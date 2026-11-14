@@ -29,6 +29,8 @@ __all__ = (
     "estimate_output_frames",
     "SpeechRateCalibrator",
     "calibrator",
+    "safety_factor",
+    "theoretical_peak_limit",
 )
 
 # 语言白名单。请求文本主要字符不属于这些语言时,直接报"不支持语言"错误。
@@ -44,7 +46,7 @@ SUPPORTED_LANGUAGES: tuple[str, ...] = (
     "fr",
 )
 
-# 各语言实际朗读语速(字符/分钟)。估算输出时长时统一乘 SAFETY_FACTOR 覆盖波动。
+# 各语言实际朗读语速(字符/分钟)。估算输出时长时乘 safety_factor() 覆盖波动。
 # 中文 350:TTS 实测略慢于普通朗读,300 偏保守导致 estimated_output 偏大、
 # 准入偏严、峰值卡 0.63;调至 350 让 estimated_output 降 ~14% 试 loosening。
 # 其余语言为典型朗读语速,上线后可用真实请求的"实际生成帧数"标定,只改这张表即可。
@@ -63,8 +65,11 @@ SPEECH_RATE_PER_MIN: dict[str, float] = {
 # MOSS-TTS codec 帧率:1 小时音频 ≈ 4.5 万帧。
 CODEC_FRAMES_PER_SEC = 12.5
 SECONDS_PER_MIN = 60.0
-# ±20% 波动余量:宁多勿少,避免超卖池子触发 retract。
-SAFETY_FACTOR = 1.2
+# 估算余量:冷启动样本不足时留 20%,累计完成 WARMUP_COMPLETIONS 个请求后
+# 语速标定已收敛,收紧到 10%,让真实占用能逼近更高的池利用率。
+INITIAL_SAFETY_FACTOR = 1.2
+SETTLED_SAFETY_FACTOR = 1.1
+WARMUP_COMPLETIONS = 10
 
 # 标定值持久化路径(相对 cwd)。重启后从该文件加载上次标定样本,避免
 # 从零重新攒 5 个样本才能覆盖默认表。多进程(DP)各持单例各自读写,
@@ -126,8 +131,8 @@ class SpeechRateCalibrator:
     (如输出直接奔 max_new_tokens 上限、或 0 值),不参与均值计算;剔除后
     剩余样本不足 :attr:`MIN_SAMPLES` 则返回 None(回退默认表)。
 
-    实测均值仍按"宁多勿少"原则:估算函数统一再乘 :data:`SAFETY_FACTOR`
-    (≈20% 波动余量)预留。``frames <= 0`` 的失败请求不参与统计。
+    实测均值仍按"宁多勿少"原则:估算函数统一再乘 :func:`safety_factor`
+    (冷启动 20% / 收敛后 10% 波动余量)预留。``frames <= 0`` 的失败请求不参与统计。
 
     持久化:构造时从 ``cache_path`` 加载上次样本(JSON,每语言一个
     [(chars, frames), ...] 列表);每次 :meth:`observe` / :meth:`reset`
@@ -160,7 +165,7 @@ class SpeechRateCalibrator:
                     (int(chars), int(frames)) for chars, frames in samples
                 )
                 self._samples[lang] = bucket
-        except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
             # 首次启动或缓存损坏,从空开始(best-effort)。
             pass
 
@@ -191,6 +196,15 @@ class SpeechRateCalibrator:
             )
             bucket.append((int(chars), int(frames)))
             self._save_cache()
+
+    @property
+    def completed_requests(self) -> int:
+        """有效完成样本数:由持久化的滑窗样本派生,重启/reset 天然一致。
+
+        每语言滑窗上限 50,饱和后不再增长,但阈值 10 早已满足,不影响切换。
+        """
+        with self._lock:
+            return sum(len(bucket) for bucket in self._samples.values())
 
     def effective_rate(self, lang: str) -> float | None:
         """实测均值语速(字符/分钟);样本不足或剔除后不足则返回 None。"""
@@ -234,6 +248,27 @@ class SpeechRateCalibrator:
 # 进程级单例:单进程 pipeline 内所有请求共享同一份标定统计。
 # 加载 ./.cache/speech_rate_calibration.json,重启复用上次标定样本。
 calibrator = SpeechRateCalibrator(cache_path=_CALIBRATION_CACHE_PATH)
+
+
+def safety_factor() -> float:
+    """估算余量:累计完成数达到阈值后从 1.2 收紧到 1.1。
+
+    冷启动没有标定样本,估算可能偏得没边,留 20% 余量防超卖;累计
+    WARMUP_COMPLETIONS 个有效完成后,语速已由实测标定,余量收窄到 10%。
+    """
+    if calibrator.completed_requests >= WARMUP_COMPLETIONS:
+        return SETTLED_SAFETY_FACTOR
+    return INITIAL_SAFETY_FACTOR
+
+
+def theoretical_peak_limit() -> float:
+    """真实 token usage 的理论硬上限 = 1 / safety_factor()。
+
+    准保证 Σ估算峰值 ≤ 池总量,而估算峰值 = 实际峰值 × safety_factor,
+    所以真实占用峰值不可能超过 total / safety_factor:1.2 → 0.83,
+    1.1 → 0.91。请求错峰完成只会让实测比这个上限更低。
+    """
+    return 1.0 / safety_factor()
 
 
 def _calibrated_rate(lang: str) -> float:
@@ -319,11 +354,12 @@ def detect_language(text: str) -> str:
 
 
 def estimate_output_frames(text: str, lang: str | None = None) -> int:
-    """估算文本最多生成多少输出帧(含 20% 波动余量)。
+    """估算文本最多生成多少输出帧(含自适应波动余量)。
 
-    公式:字符数 / 语速(字符/分) × 60 秒 × 12.5Hz × SAFETY_FACTOR。
+    公式:字符数 / 语速(字符/分) × 60 秒 × 12.5Hz × safety_factor()。
     语速优先取运行时标定均值(≥5 个样本后生效),否则用默认表;每次调用
-    实时查询,负载变化后自动跟随。
+    实时查询,负载变化后自动跟随。安全系数在累计完成 10 个请求后由 1.2
+    收紧到 1.1,因此后续请求的估算会更贴近真实峰值。
     """
     if lang is None:
         lang = detect_language(text)
@@ -338,6 +374,6 @@ def estimate_output_frames(text: str, lang: str | None = None) -> int:
     rate = _calibrated_rate(lang)
     minutes = chars / rate
     frames = int(
-        minutes * SECONDS_PER_MIN * CODEC_FRAMES_PER_SEC * SAFETY_FACTOR
+        minutes * SECONDS_PER_MIN * CODEC_FRAMES_PER_SEC * safety_factor()
     )
     return max(frames, 1)

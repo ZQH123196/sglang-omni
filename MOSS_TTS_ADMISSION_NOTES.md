@@ -23,7 +23,7 @@
 | 不支持的语言进队列 | `speech_budget` 白名单在 preprocess 阶段抛 `UnsupportedLanguageError` | `request_builders.py` + `speech_budget.py` | **自定义，保留** |
 | 语速估算偏差 | `SpeechRateCalibrator` 按语言回喂实际帧数 | `speech_budget.py` | **自定义，保留** |
 | post_prefill 0s 音频 | ~~移除 `is_prefill_only` 早返回~~ → **已让位上游**，靠 `max_running_requests` 控并发 | `model_runner.py` | 已移除，见「同步记录」 |
-| 无准入控制 → KV 打爆 | 容量预留 + 语速标定 + rebalance 账本，**重挂到上游新版 `get_new_batch_prefill` 开头** | `omni_scheduler.py` + `speech_budget.py` | **自定义，核心设计，保留** |
+| 无准入控制 → KV 打爆 | 容量预留 + 语速标定 + `waiting_queue` 切分账本，**挂在 `get_new_batch_prefill` 开头** | `omni_scheduler.py` + `speech_budget.py` | **自定义，核心设计，保留** |
 
 ## 自定义架构三层
 
@@ -35,7 +35,7 @@ stages:
   tts_engine:
     gpu_memory_fraction: 0.60
     engine:
-      max_running_requests: 64
+      max_running_requests: 128
       max_prefill_tokens: 35000
 ```
 
@@ -62,8 +62,8 @@ colocated 下 prefill 精确长度图 1–512、vocoder 单段图 ≤128 帧。
 - 80G 卡：AR `0.72 × 80 = 57.6G` → `0.60 × 80 = 48.0G`
 - 48G 卡：`34.6G` → `28.8G`
 
-账本按池子实时余额放行，池子缩小**不会溢出**，但会直接表现为 `speech-admit defer` 变多、排队变长。
-`max_running_requests`（64 / 8）与语速表、`SAFETY_FACTOR` 是按旧池子调的，缩池后需复测。
+账本按池子实时余额放行，池子缩小**不会溢出**，但会直接表现为 `speech-admit 暂缓` 变多、排队变长。
+`max_running_requests`（prod 现为 128，小显存档更低）与语速表、`safety_factor()` 是按池子实测调的，改并发后需复测。
 
 **若某档要换回容量**：只关图不会自动回到 0.72，必须两者都改。
 
@@ -75,7 +75,7 @@ stages:
       cuda_graph_backend_prefill: disabled
 ```
 
-48G 档并发仅 8，吃不到 lookahead 收益却同样付容量与启动成本；该档出现频繁 defer 时应优先走上面这条。
+48G 档并发仅 8，吃不到 lookahead 收益却同样付容量与启动成本；该档出现频繁暂缓时应优先走上面这条。
 
 **不用担心的**：lookahead 让 `len(req.output_ids)` 落后半步，账本 `remaining = 估算 − 已解码`
 因此每请求多留约 1 帧，方向保守（64 并发合计 ≈64 token）；`nonstream` 模式下流式与混合批次
@@ -94,29 +94,45 @@ stages:
 
 **omni_scheduler.py — 容量预留账本**
 
-- 请求进入 `get_new_batch_prefill` 前，按估算帧数 + 输入 token 数预留 KV 空间
-- 预留不够 → defer（放入等待队列），不浪费引擎调度 slot
-- 请求完成/abort → 释放预留，触发 rebalance 事件把 deferred 请求放回
-- 利用 radix tree 前缀命中计算真实增量（ref audio 相同则不重复预留）
+- 请求进入 `get_new_batch_prefill` 前，按估算帧数 + 输入 token 数算峰值足迹
+- 预算 = allocator 真空闲 + radix 可驱逐 − running 请求未来增长；放不下的本轮暂缓，
+  按原顺序留在 `waiting_queue`，下一轮重新评估（无第二套队列、无 rebalance、无 abort 清理）
+- radix 可驱逐空间必须计入可用：请求完成后 KV 挂在 radix tree 上不回 free list
+  （`release_kv_cache(..., checkpoint=True)`），只看 `available_size()` 会越估越紧、把并发饿死
+- 利用 radix tree 前缀命中计算真实增量（ref audio 相同则不重复预留）；预算连
+  「最小输入 1 + 估算输出帧」都覆盖不了的请求直接跳过精算，避免每轮重复 radix 匹配
+- 估算余量 `safety_factor()` 自适应：有效完成样本 <10 个为 1.2，≥10 个收紧到 1.1；
+  对应真实 token usage 的理论硬上限 0.83 → 0.91，随 `预计占用` 一起打印。
+  完成数由持久化的滑窗样本数派生，重启 / `reset()` 后天然一致
 
 **为什么非要有这层**：上游不看 KV 池的实时余量（其 `omni_scheduler.py` 里 `available_size()`
 命中 0 次），只有两道粗粒度闸门——`max_running_requests` 管**行数**，`request_kv_capacity_error`
 管**单个请求**的 `input_len + max_new_tokens <= max_req_len`（自 `dde550c23`，2026-05-18 就有，
-不是本轮新增）。两者都不阻止"64 个并发各自要生成数万帧"的**叠加**占用，所以 `prod` 配 64 并发
+不是本轮新增）。两者都不阻止"上百个并发各自要生成数万帧"的**叠加**占用，所以 `prod` 配 128 并发
 跑长文本时必须靠账本兜住。
 
-**同步时怎么挂**：账本与上游的 prefill coalesce 是两个正交关注点，不冲突。新版只在
-上游 `get_new_batch_prefill` 的**最前面**加 2 行，其余全部委托上游：
+**同步时怎么挂**：账本与上游的 prefill coalesce 是两个正交关注点，不冲突。准入只在
+`OmniScheduler.get_new_batch_prefill` 里临时截断 `waiting_queue`，委托上游后按原顺序稳定归并：
 
 ```python
-self._rebalance_speech_deferred()
-self._defer_unadmittable_prefill_requests()
-waiting = self.prefill_coalesce_waiting_requests(running_batch)   # 上游原样
+admitted, held = self._speech_split_waiting()
+if not held:
+    return self._get_new_batch_prefill_inner(running_batch)
+order = {id(req): i for i, req in enumerate(self.waiting_queue)}
+self.waiting_queue = admitted
+try:
+    return self._get_new_batch_prefill_inner(running_batch)   # 原分流逻辑
+finally:
+    self.waiting_queue = sorted(
+        held + self.waiting_queue,
+        key=lambda req: order.get(id(req), len(order)),
+    )
 ```
 
-顺序要求：账本先跑，把不放行的请求移出 `waiting_queue`，上游 coalesce 的"最老请求截止期"
-才只度量真正待批的请求。以后重放**必须保持账本在这三行之前**，挂在 `else` 分支或
-`_Upstream` 调用之后都会让预留失效。
+顺序要求：账本先跑，上游 coalesce 的"最老请求截止期"才只度量真正待批的请求。
+以后重放**必须保持账本在委托上游之前**，挂在 `else` 分支或 `_Upstream` 调用之后
+都会让预留失效。恢复必须按原始位置稳定归并：把 held 无条件前置会逐轮累积打乱
+FIFO，且内层 `parked_requests` 的前置会叠加进来；调用期间新入队的请求排末尾。
 
 ### 第三层：post_prefill 首帧修复（已让位上游）
 
@@ -128,6 +144,8 @@ if schedule_batch.is_prefill_only:
 并发打满时纯 prefill batch 高频出现，跳过后导致 pending_feedback_queue 为空 → 全 0 embeds → 垃圾 logits → argmax 命中 im_end → 立即 EOS → 0s 音频。
 
 **2026-10-17 起本分支采用上游实现，不再修改此处**；上游至今仍有该早返回（`8220d2207` 只改了 `custom_prefill_forward`，没碰 `post_prefill`）。所以该故障模式重新可见，唯一兜法是 `max_running_requests`：纯 prefill batch 是并发打满的产物，把并发上限留在不触发它的区间（48G 档 8、prod 档 64）。注意上游 `fa4e6d1f1` 的 prefill coalesce 正是为了一次攒够多个请求放 prefill，纯 prefill batch 不会因此变少。
+
+**2026-11-14 更新**：`moss_tts_prod.yaml` 的 `max_running_requests` 已由 64 提到 128，越出上述兜底区间。上机必须复测长文本高并发下的 0s 音频；若复现，回退到 64，或按下面「原修复」重新删除两处 early return。
 
 原修复：删除两处 early return，见 `backup/my-deploy-20261017`。
 
@@ -148,7 +166,7 @@ if schedule_batch.is_prefill_only:
 
 | 场景 | 配置文件 | 关键参数 |
 |---|---|---|
-| A100-80G / H100 / H200 (80G+) | `moss_tts_prod.yaml` | gpu_fraction=0.60, max_running=64, prefill=35000 |
+| A100-80G / H100 / H200 (80G+) | `moss_tts_prod.yaml` | gpu_fraction=0.60, max_running=128, prefill=35000 |
 | A6000 (48G) | `moss_tts_48gb.yaml` | gpu_fraction=0.60, max_running=8, prefill=16384 |
 | RTX 5090 (32G) | `moss_tts_32gb.yaml`（上游） | single-process, concurrency=1 |
 | RTX 4090 (24G) 及以下 | `moss_tts_24gb.yaml`（上游） | single-process, concurrency=1 |
@@ -189,10 +207,12 @@ if schedule_batch.is_prefill_only:
 
 ### 未让位：KV 容量预留账本（重挂保留）
 
-账本（`_speech_effective_free` 等 6 个 helper + `_speech_deferred` 队列 + rebalance + abort 清理）
-与上游的 coalesce 重构是**正交**的，不构成冲突，因此不需要让位。上游也没有等价物——它不看
-池子实时余量（`available_size()` 命中 0 次），只有行数上限与单请求上限两道粗闸门。
-它按上游新结构重挂在上游 `get_new_batch_prefill` 开头，挂载契约见「第二层」。
+账本（`_speech_effective_free` / `_speech_running_committed_future` /
+`_speech_admit_input_increment` / `_speech_split_waiting` 等五个 helper，无独立队列、
+无 rebalance、无 abort 清理）与上游的 coalesce 重构是**正交**的，不构成冲突，
+因此不需要让位。上游也没有等价物——它不看池子实时余量（`available_size()` 命中 0 次），
+只有行数上限与单请求上限两道粗闸门。它按上游新结构挂在 `get_new_batch_prefill` 开头，
+挂载契约见「第二层」。
 
 **一次错误决策的记录**：同步过程中曾因"`_resolve_token_count` 在本分支上是未定义名、
 `_estimate_moss_tts_speech_frames` 必抛 `NameError`"而推断这套账本从未生效，并据此删除了它。
