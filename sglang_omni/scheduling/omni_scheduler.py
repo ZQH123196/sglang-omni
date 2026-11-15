@@ -154,8 +154,12 @@ _COMPLETED_REQUEST_ID_LIMIT = 10000
 _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
 _IDLE_WAIT_S = 0.02
-# 容量准入日志的最小间隔(秒)。暂缓状态稳定时完全不打,只在状态翻转或
-# 排队数变化且超过该间隔时打一条,避免每个调度轮次(~20ms)刷一条 INFO。
+# 容量准入账本重算周期(秒)。在途承诺需遍历 running 请求 O(N),每轮算太浪费;
+# 每 1s 重算一次,其余轮次只读 O(1) 池子计数器。池子每秒仅变化约 0.3%,
+# 1s 的滞后远小于安全余量。
+_SPEECH_ADMIT_SAMPLE_INTERVAL_S = 1.0
+# 容量准入日志的最小间隔(秒)。日志只在采样轮判定,天然 <=1 条/s;稳定态
+# 完全不打,只在状态翻转或排队数变化且超过该间隔时打一条。
 _SPEECH_ADMIT_LOG_INTERVAL_S = 5.0
 MAX_STREAM_ALLOCATION_ATTEMPTS = 65
 
@@ -596,7 +600,13 @@ class OmniScheduler(Generic[RequestDataT]):
         self._speech_admit_banner_logged: bool = False
         self._speech_admit_no_estimate_logged: bool = False
         self._speech_admit_init_fallback_logged: bool = False
-        # 暂缓日志去重:记录上一轮暂缓数与上次打印时间,稳定态不刷屏。
+        # 账本采样缓存:上次重算时间、缓存的在途承诺、采样窗口内已放行请求
+        # 的未来输出帧(按 rid 去重,防放行但未被上游取走的请求重复累计)。
+        self._speech_admit_sample_ts: float = 0.0
+        self._speech_admit_cached_committed: int = 0
+        self._speech_admit_window_reserved: dict = {}
+        self._speech_admit_window_total: int = 0
+        # 暂缓日志去重:记录上次采样时的暂缓数与上次打印时间,稳定态不刷屏。
         self._speech_admit_last_held: int = 0
         self._speech_admit_last_log_ts: float = 0.0
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -2313,8 +2323,8 @@ class OmniScheduler(Generic[RequestDataT]):
         length = int(getattr(ext, "length", 0) or 0)
         return max(1, length)  # radix 全命中时为 0,兜底 1
 
-    def _speech_effective_free(self) -> tuple[int, int, int]:
-        """返回 (可用空间, 在途承诺, 扣除承诺后还能接纳的峰值)。
+    def _speech_pool_available(self) -> int:
+        """O(1) 读池子计数器,每轮调度都调,用于实时刹车。
 
         可用空间 = allocator 真空闲 + radix cache 可驱逐部分。请求完成后 KV
         不回 free list,而是挂在 radix tree 上变成 evictable(见
@@ -2326,9 +2336,47 @@ class OmniScheduler(Generic[RequestDataT]):
         evictable = getattr(self.tree_cache, "evictable_size", 0)
         if callable(evictable):
             evictable = evictable()
-        available = pool.available_size() + int(evictable or 0)
+        return pool.available_size() + int(evictable or 0)
+
+    def _speech_effective_free(self) -> tuple[int, int, int]:
+        """完整重算账本 (可用空间, 在途承诺, 预算),仅在采样轮调用。
+
+        在途承诺要遍历 running_batch.reqs 累加各请求的剩余输出帧,是这里唯一
+        的 O(N) 部分;其余量都是计数器。由 :meth:`_speech_admit_budget` 按
+        _SPEECH_ADMIT_SAMPLE_INTERVAL_S 节流调用。
+        """
+        available = self._speech_pool_available()
         committed = self._speech_running_committed_future()
         return available, committed, available - committed
+
+    def _speech_admit_budget(self) -> tuple[int, int, int, bool]:
+        """返回 (可用空间, 在途承诺, 预算, 本轮是否重采样)。
+
+        分工:
+        - 可用空间每轮 O(1) 实时读,池子被占立即反映,刹车不延迟。
+        - 在途承诺(遍历 running 请求 O(N))每 1s 重算一次并缓存。池子每秒
+          只变化约 0.3%,缓存 1s 的滞后是保守方向(available 已随 decode
+          减少,承诺却仍按采样值算),只会少放行、不会超卖。
+        - 采样窗口内已放行请求的估算输出帧必须补扣:否则 1s 内每轮都按旧
+          承诺放行同一块空间,会连续超卖。按 rid 去重,放行但未被上游取走、
+          下轮仍在 waiting_queue 的请求只累计一次;下次采样时它们已进入
+          running_batch,由完整重算接管,窗口清空。
+          边界:采样轮清空窗口时,极少数刚放行、还没进 running_batch 的请求
+          会被完整重算漏掉一轮(<=1s),但其输入 KV 已实时扣掉 available,
+          且池子每秒仅变化 0.3%,不构成超卖风险。
+        """
+        now = time.monotonic()
+        sampled = (
+            now - self._speech_admit_sample_ts >= _SPEECH_ADMIT_SAMPLE_INTERVAL_S
+        )
+        if sampled:
+            _, self._speech_admit_cached_committed, _ = self._speech_effective_free()
+            self._speech_admit_sample_ts = now
+            self._speech_admit_window_reserved.clear()
+            self._speech_admit_window_total = 0
+        available = self._speech_pool_available()
+        committed = self._speech_admit_cached_committed + self._speech_admit_window_total
+        return available, committed, available - committed, sampled
 
     def _speech_admit_usage_text(
         self, available: int, running_committed_future: int
@@ -2367,11 +2415,13 @@ class OmniScheduler(Generic[RequestDataT]):
 
         唯一规则:新请求的峰值足迹(radix 后输入增量 + 估算输出帧)放得下才
         放行。调用方在 try/finally 里临时截断 waiting_queue,结束后把暂缓的
-        放回队首——下一轮重新评估,不需要第二套队列、不需要定时归还,池子
-        一释放立刻生效。
+        放回队首——下一轮重新评估,不需要第二套队列、不需要定时归还。
 
         预算 = 真空闲 + radix 可驱逐 − running 请求未来增长;循环内串行扣减
-        防同一批超卖。无估算字段的请求放行,由上游兜底。
+        防同一批超卖。无估算字段的请求放行,由上游兜底。预算由
+        :meth:`_speech_admit_budget` 给出:池子可用空间每轮实时读(释放立即
+        反映),在途承诺每 1s 重算一次;因此"释放→放行"在承诺侧最多滞后 1s,
+        且方向保守。
         """
         if not self._speech_admit_banner_logged:
             self._speech_admit_banner_logged = True
@@ -2382,7 +2432,7 @@ class OmniScheduler(Generic[RequestDataT]):
             )
         # 空队列也走完整流程:这样暂缓状态能正常归零(否则队列一空就跳过,
         # 下次有请求时 prev_held 还停在旧值,解除事件会丢)。
-        available, committed, budget = self._speech_effective_free()
+        available, committed, budget, sampled = self._speech_admit_budget()
         admitted: list = []
         held: list = []
         with_estimate = 0
@@ -2405,42 +2455,47 @@ class OmniScheduler(Generic[RequestDataT]):
             if budget >= need:
                 admitted.append(req)
                 budget -= need  # 串行预留,防同批超卖
+                # 本采样窗口内已放行的输出帧记入承诺,防 1s 内每轮重复放行。
+                # 按 rid 去重:同一请求连续多轮被放行只记一次。
+                rid = getattr(req, "rid", None) or id(req)
+                if rid not in self._speech_admit_window_reserved:
+                    self._speech_admit_window_reserved[rid] = est
+                    self._speech_admit_window_total += est
             else:
                 held.append(req)
 
-        # 事件驱动日志:本方法每轮调度都会跑(~20ms),稳定态下 held 非空且
-        # 数量不变时一条都不打。只在"开始/解除暂缓"时立刻打,其余数量变化
-        # 最多每 _SPEECH_ADMIT_LOG_INTERVAL_S 打一条慢速心跳。
-        held_count = len(held)
-        prev_held = self._speech_admit_last_held
-        state_flip = (held_count == 0) != (prev_held == 0)
-        now = time.monotonic()
-        if state_flip or (
-            held_count != prev_held
-            and now - self._speech_admit_last_log_ts >= _SPEECH_ADMIT_LOG_INTERVAL_S
-        ):
-            self._speech_admit_last_log_ts = now
-            if held_count:
+        # 日志只在采样轮判定:天然 <=1 条/s,且稳定态(暂缓数不变)完全不打。
+        # 其余轮次连字符串都不拼,不产生任何 INFO。
+        if sampled:
+            held_count = len(held)
+            prev_held = self._speech_admit_last_held
+            state_flip = (held_count == 0) != (prev_held == 0)
+            now = time.monotonic()
+            if state_flip or (
+                held_count != prev_held
+                and now - self._speech_admit_last_log_ts >= _SPEECH_ADMIT_LOG_INTERVAL_S
+            ):
+                self._speech_admit_last_log_ts = now
+                if held_count:
+                    logger.info(
+                        f"speech-admit 暂缓:{held_count} 个请求本轮不参与调度,"
+                        f"{self._speech_admit_usage_text(available, committed)}"
+                    )
+                else:
+                    logger.info(
+                        "speech-admit 暂缓解除,"
+                        f"{self._speech_admit_usage_text(available, committed)}"
+                    )
+            self._speech_admit_last_held = held_count
+            all_without_estimate = with_estimate == 0 and without_estimate > 0
+            if all_without_estimate and not self._speech_admit_no_estimate_logged:
+                self._speech_admit_no_estimate_logged = True
                 logger.info(
-                    f"speech-admit 暂缓:{held_count} 个请求本轮不参与调度,"
-                    f"{self._speech_admit_usage_text(available, committed)}"
+                    f"speech-admit 缺少估算:{without_estimate} 个等待请求"
+                    f"没有 _moss_speech_frames,准入无法约束(preprocess 未挂字段?)"
                 )
-            else:
-                logger.info(
-                    "speech-admit 暂缓解除,"
-                    f"{self._speech_admit_usage_text(available, committed)}"
-                )
-        self._speech_admit_last_held = held_count
-
-        all_without_estimate = with_estimate == 0 and without_estimate > 0
-        if all_without_estimate and not self._speech_admit_no_estimate_logged:
-            self._speech_admit_no_estimate_logged = True
-            logger.info(
-                f"speech-admit 缺少估算:{without_estimate} 个等待请求"
-                f"没有 _moss_speech_frames,准入无法约束(preprocess 未挂字段?)"
-            )
-        elif not all_without_estimate:
-            self._speech_admit_no_estimate_logged = False
+            elif not all_without_estimate:
+                self._speech_admit_no_estimate_logged = False
         return admitted, held
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:

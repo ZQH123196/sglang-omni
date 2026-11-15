@@ -107,8 +107,15 @@ stages:
 - 日志打印的是 **`预计真实占用` = 账本占用 / safety_factor()**，与 `理论峰值上限`、
   上游 `token usage` 同口径。账本占用本身上限是 1.00（准入规则就是把它填满），
   直接打印会出现 0.99 > 0.91 这种看似超卖、实则正常的数字
-- 暂缓日志事件驱动：状态翻转（开始/解除）立刻打一条，其余变化最多每 5s 一条，
-  稳定态不打。排队总数一律看上游 `#queue-req`，不用日志数
+- **账本重算 1s 一次**（`_SPEECH_ADMIT_SAMPLE_INTERVAL_S`）：在途承诺要遍历
+  `running_batch.reqs` 累加剩余输出帧，是唯一的 O(N) 部分，按 1s 缓存；池子可用空间
+  `available_size() + evictable_size()` 是 O(1) 计数器，**每轮仍实时读**，刹车不延迟。
+  池子每秒只变化约 0.3%，缓存滞后方向保守（只少放行、不超卖）。
+  采样窗口内新放行请求的估算输出帧按 rid 去重补扣进承诺，防 1s 内每轮按旧承诺
+  重复放行同一块空间；下次采样由完整重算接管并清空窗口
+- **日志只在采样轮判定**：天然 ≤1 条/s，且稳定态（暂缓数不变）完全不打，
+  其余轮次连字符串都不拼。状态翻转立刻打一条，其余变化最多每 5s 一条。
+  排队总数一律看上游 `#queue-req`，不用日志数
 
 **为什么非要有这层**：上游不看 KV 池的实时余量（其 `omni_scheduler.py` 里 `available_size()`
 命中 0 次），只有两道粗粒度闸门——`max_running_requests` 管**行数**，`request_kv_capacity_error`
@@ -212,8 +219,9 @@ if schedule_batch.is_prefill_only:
 
 ### 未让位：KV 容量预留账本（重挂保留）
 
-账本（`_speech_effective_free` / `_speech_running_committed_future` /
-`_speech_admit_input_increment` / `_speech_split_waiting` 等五个 helper，无独立队列、
+账本（`_speech_pool_available` / `_speech_effective_free` / `_speech_admit_budget` /
+`_speech_running_committed_future` / `_speech_admit_input_increment` /
+`_speech_split_waiting` 等 helper，账本重算 1s 采样，无独立队列、
 无 rebalance、无 abort 清理）与上游的 coalesce 重构是**正交**的，不构成冲突，
 因此不需要让位。上游也没有等价物——它不看池子实时余量（`available_size()` 命中 0 次），
 只有行数上限与单请求上限两道粗闸门。它按上游新结构挂在 `get_new_batch_prefill` 开头，
